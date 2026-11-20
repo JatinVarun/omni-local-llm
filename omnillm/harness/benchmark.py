@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from omnillm.core.manager import LocalLLMManager
+from omnillm.core.types import ChatChunk
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +44,7 @@ class BenchmarkMetrics:
     prompt_tokens: int
     completion_tokens: int
     tokens_per_second: float
+    token_counts_exact: bool = False
 
 
 @dataclass(slots=True)
@@ -85,6 +87,7 @@ class BenchmarkResult:
                     "prompt_tokens": r.prompt_tokens,
                     "completion_tokens": r.completion_tokens,
                     "tokens_per_second": round(r.tokens_per_second, 2),
+                    "token_counts_exact": r.token_counts_exact,
                 }
                 for r in self.runs
             ],
@@ -137,6 +140,51 @@ class BenchmarkSuite:
         print(self.format_table())
 
 
+class _RunRecorder:
+    """Times one streamed generation and counts tokens.
+
+    Token counts come from the backend's reported usage when available (exact); otherwise each content
+    chunk is counted as one token, which matches how Ollama and llama.cpp stream.
+    """
+
+    def __init__(self, prompt: str):
+        self._prompt = prompt
+        self._start = time.perf_counter()
+        self._first_token: float | None = None
+        self._content_chunks = 0
+        self._prompt_tokens: int | None = None
+        self._completion_tokens: int | None = None
+
+    def observe(self, chunk: object) -> None:
+        if getattr(chunk, "content", ""):
+            if self._first_token is None:
+                self._first_token = time.perf_counter()
+            self._content_chunks += 1
+        usage = chunk.usage if isinstance(chunk, ChatChunk) else None
+        if usage is not None:
+            if usage.prompt_tokens is not None:
+                self._prompt_tokens = usage.prompt_tokens
+            if usage.completion_tokens is not None:
+                self._completion_tokens = usage.completion_tokens
+
+    def finish(self) -> BenchmarkMetrics:
+        end = time.perf_counter()
+        first = self._first_token or end
+        exact = self._completion_tokens is not None
+        completion = self._completion_tokens if self._completion_tokens is not None else self._content_chunks
+        # Decode throughput: tokens generated after the first one, over the time since the first one.
+        decode_seconds = end - first
+        tps = (completion - 1) / decode_seconds if completion > 1 and decode_seconds > 0.001 else 0.0
+        return BenchmarkMetrics(
+            ttft_ms=(first - self._start) * 1000,
+            total_time_ms=(end - self._start) * 1000,
+            prompt_tokens=self._prompt_tokens if self._prompt_tokens is not None else len(self._prompt) // 4,
+            completion_tokens=completion,
+            tokens_per_second=tps,
+            token_counts_exact=exact,
+        )
+
+
 class BenchmarkHarness:
     """Harness for performance benchmarking, measuring TTFT, throughput (tokens/sec), and latency."""
 
@@ -171,10 +219,7 @@ class BenchmarkHarness:
                     )
 
             for _ in range(runs):
-                start_time = time.perf_counter()
-                first_token_time: float | None = None
-                tokens_count = 0
-
+                recorder = _RunRecorder(prompt)
                 stream = self.manager.chat(
                     backend=target.backend,
                     model=target.model,
@@ -183,31 +228,10 @@ class BenchmarkHarness:
                     max_tokens=max_tokens,
                     **target.options,
                 )
-
                 if isinstance(stream, Iterator):
                     for chunk in stream:
-                        content = getattr(chunk, "content", "")
-                        if content:
-                            if first_token_time is None:
-                                first_token_time = time.perf_counter()
-                            tokens_count += max(1, len(content) // 4)
-
-                end_time = time.perf_counter()
-                total_duration = end_time - start_time
-                ttft = ((first_token_time or end_time) - start_time) * 1000
-
-                gen_duration = total_duration - (ttft / 1000)
-                tps = tokens_count / gen_duration if gen_duration > 0.001 else 0.0
-
-                res.runs.append(
-                    BenchmarkMetrics(
-                        ttft_ms=ttft,
-                        total_time_ms=total_duration * 1000,
-                        prompt_tokens=len(prompt) // 4,
-                        completion_tokens=tokens_count,
-                        tokens_per_second=tps,
-                    )
-                )
+                        recorder.observe(chunk)
+                res.runs.append(recorder.finish())
 
             suite.results.append(res)
 
@@ -241,10 +265,7 @@ class BenchmarkHarness:
                     )
 
             for _ in range(runs):
-                start_time = time.perf_counter()
-                first_token_time: float | None = None
-                tokens_count = 0
-
+                recorder = _RunRecorder(prompt)
                 stream = await self.manager.achat(
                     backend=target.backend,
                     model=target.model,
@@ -253,31 +274,10 @@ class BenchmarkHarness:
                     max_tokens=max_tokens,
                     **target.options,
                 )
-
                 if isinstance(stream, AsyncIterator):
                     async for chunk in stream:
-                        content = getattr(chunk, "content", "")
-                        if content:
-                            if first_token_time is None:
-                                first_token_time = time.perf_counter()
-                            tokens_count += max(1, len(content) // 4)
-
-                end_time = time.perf_counter()
-                total_duration = end_time - start_time
-                ttft = ((first_token_time or end_time) - start_time) * 1000
-
-                gen_duration = total_duration - (ttft / 1000)
-                tps = tokens_count / gen_duration if gen_duration > 0.001 else 0.0
-
-                res.runs.append(
-                    BenchmarkMetrics(
-                        ttft_ms=ttft,
-                        total_time_ms=total_duration * 1000,
-                        prompt_tokens=len(prompt) // 4,
-                        completion_tokens=tokens_count,
-                        tokens_per_second=tps,
-                    )
-                )
+                        recorder.observe(chunk)
+                res.runs.append(recorder.finish())
 
             suite.results.append(res)
 

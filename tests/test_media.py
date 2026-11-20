@@ -3,12 +3,14 @@ from pathlib import Path
 
 import pytest
 
+from omnillm.core.errors import InvalidRequestError
 from omnillm.core.media import (
     encode_image_to_base64,
     encode_image_to_data_uri,
     has_images,
     normalize_messages_for_ollama,
     normalize_messages_for_openai,
+    sanitize_untrusted_messages,
 )
 
 
@@ -113,3 +115,73 @@ def test_normalize_messages_for_openai(tmp_path: Path):
             ],
         }
     ]
+
+
+def test_sanitize_never_reads_a_base64_shaped_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.chdir(tmp_path)
+    # "abcd" is valid base64 *and* an existing relative path: the server must treat it as data, never read the file.
+    (tmp_path / "abcd").write_bytes(b"top secret")
+
+    result = sanitize_untrusted_messages([{"role": "user", "content": "x", "images": ["abcd"]}])
+
+    assert result[0]["images"] == ["data:image/jpeg;base64,abcd"]
+    ollama_messages = normalize_messages_for_ollama(result)
+    assert ollama_messages[0]["images"] == ["abcd"]
+    openai_messages = normalize_messages_for_openai(result)
+    assert openai_messages[0]["content"][-1]["image_url"]["url"] == "data:image/jpeg;base64,abcd"
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "https://example.com/cat.png",
+        "data:text/plain;base64,aGVsbG8=",
+        "data:image/png,rawdata",
+        "data:image/png;base64,***",
+        "",
+    ],
+)
+def test_sanitize_rejects_remote_urls_and_malformed_images(image: str):
+    with pytest.raises(InvalidRequestError):
+        sanitize_untrusted_messages([{"role": "user", "content": "x", "images": [image]}])
+    with pytest.raises(InvalidRequestError):
+        sanitize_untrusted_messages([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": image}}]}])
+
+
+def test_sanitize_normalizes_image_url_parts_and_keeps_other_fields():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8=", "detail": "low"}},
+            ],
+        }
+    ]
+
+    result = sanitize_untrusted_messages(messages)
+
+    assert result[0]["content"][0] == {"type": "text", "text": "hi"}
+    assert result[0]["content"][1]["image_url"] == {"url": "data:image/png;base64,aGVsbG8=", "detail": "low"}
+    assert messages[0]["content"][1]["image_url"]["detail"] == "low"  # input not mutated
+
+
+def test_tool_calls_are_converted_between_openai_and_ollama_shapes():
+    openai_call = {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": '{"a": 1}'}}
+    history = [
+        {"role": "assistant", "content": "", "tool_calls": [openai_call]},
+        {"role": "tool", "tool_call_id": "call_1", "name": "f", "content": "2"},
+    ]
+
+    ollama = normalize_messages_for_ollama(history)
+    assert ollama[0]["tool_calls"] == [{"function": {"name": "f", "arguments": {"a": 1}}}]
+    assert ollama[1]["tool_name"] == "f"
+
+    ollama_history = [
+        {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "f", "arguments": {"a": 1}}}]}
+    ]
+    openai = normalize_messages_for_openai(ollama_history)
+    call = openai[0]["tool_calls"][0]
+    assert call["type"] == "function"
+    assert call["id"].startswith("call_")
+    assert call["function"] == {"name": "f", "arguments": '{"a": 1}'}

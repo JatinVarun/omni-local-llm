@@ -249,7 +249,11 @@ response = await session.aact(
 )
 ```
 
-Manual low-level OpenAI-format tool calling is also supported via `manager.chat(..., tools=tools)`.
+Tool schemas are generated from type hints and docstrings: `Optional`, `list[X]`, `dict[str, X]`, `Literal`, `Enum`, Pydantic models (arguments are validated into model instances), `Annotated[str, "description"]`, and Google- or Sphinx-style `Args:` descriptions are all supported. Good schemas matter a lot for small local models.
+
+`max_steps` bounds the number of model calls. The whole exchange (user message, tool calls, tool results, final answer) is committed to session history only once the model gives a final answer. If the budget runs out while the model is still requesting tools, `ToolLoopLimitError` is raised (with `.response` and `.messages` for inspection) and history is left unchanged.
+
+Manual low-level OpenAI-format tool calling is also supported via `manager.chat(..., tools=tools)`. Tool calls are always returned in OpenAI format (`id`, `type`, JSON-string `arguments`) regardless of backend.
 
 #### Structured Outputs & Pydantic Validation
 
@@ -639,6 +643,23 @@ embedding_res = client.embeddings.create(
 print(embedding_res.data[0].embedding)
 ```
 
+#### Server notes
+
+- **llama.cpp models** need a GGUF filename, passed as a non-standard field (`extra_body` in the OpenAI SDK):
+
+  ```python
+  client.chat.completions.create(
+      model="llama.cpp/unsloth/llama-3-8b-Instruct-GGUF",
+      messages=[{"role": "user", "content": "Hi"}],
+      extra_body={"filename": "llama-3-8b-Instruct-Q4_K_M.gguf"},
+  )
+  ```
+
+  An in-process llama.cpp model handles one request at a time; concurrent requests are queued.
+- **Images** must be sent inline as base64 or `data:image/...;base64,...` URIs. Local file paths and remote URLs are rejected so API clients can never make the server read its own files or fetch arbitrary URLs.
+- **`tool_choice`**: `"auto"` and `"none"` are supported; forcing a specific tool is not possible with local backends and returns a 400.
+- `seed`, `max_completion_tokens`, and `stream_options: {"include_usage": true}` are supported.
+
 #### Use with curl
 
 ```bash
@@ -720,7 +741,7 @@ This project is licensed under the **MIT License** — see the [LICENSE](LICENSE
 - [ ] vLLM backend adapter
 - [ ] KoboldCpp backend adapter
 - [ ] Token usage tracking and reporting
-- [ ] Vision/multimodal support
+- [x] Vision/multimodal support
 - [ ] Model hot-swapping in sessions
 - [ ] Prompt template management
 - [ ] Docker image for the API server

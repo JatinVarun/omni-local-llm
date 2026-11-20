@@ -43,6 +43,7 @@ class ChatRequest:
     max_tokens: int | None = None
     top_p: float | None = None
     stop: str | Sequence[str] | None = None
+    seed: int | None = None
     model_source: ModelSource = field(default_factory=ModelSource)
     runtime: RuntimeOptions = field(default_factory=RuntimeOptions)
 
@@ -134,6 +135,7 @@ class ChatChunk:
     content: str = ""
     tool_calls: Sequence[ToolCall] = field(default_factory=tuple)
     finish_reason: FinishReason | None = None
+    usage: Usage | None = None
 
 
 @dataclass(frozen=True, slots=True)
