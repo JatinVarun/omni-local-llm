@@ -182,3 +182,19 @@ def test_needle_harness():
     table = result.format_table()
     assert "FOUND" in table
     assert "100.0%" in table
+
+
+def test_benchmark_prefers_backend_reported_token_counts():
+    from omnillm import Usage
+
+    exact = RecordingBackend(
+        chunks=(ChatChunk(content="Hello"), ChatChunk(content=" world", finish_reason="stop", usage=Usage(11, 40)))
+    )
+    estimated = RecordingBackend(chunks=(ChatChunk(content="a longer chunk of text"), ChatChunk(content="b")))
+    harness = BenchmarkHarness(LocalLLMManager({"exact": exact, "est": estimated}))
+
+    suite = harness.run(targets=[("exact", "m"), ("est", "m")], prompt="Hi", runs=1, warmup=False)
+
+    exact_run, estimated_run = suite.results[0].runs[0], suite.results[1].runs[0]
+    assert (exact_run.prompt_tokens, exact_run.completion_tokens, exact_run.token_counts_exact) == (11, 40, True)
+    assert (estimated_run.completion_tokens, estimated_run.token_counts_exact) == (2, False)

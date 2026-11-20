@@ -1,3 +1,11 @@
+from .core.errors import (
+    BackendNotFoundError,
+    BackendUnavailableError,
+    InvalidRequestError,
+    OmniLLMError,
+    ToolLoopLimitError,
+    UnsupportedFeatureError,
+)
 from .core.hardware import (
     FitRecommendation,
     HardwareProfile,
@@ -24,6 +32,8 @@ from .harness import BenchmarkHarness, EvalHarness, NeedleHarness
 
 __version__ = "0.3.0"
 __all__ = [
+    "BackendNotFoundError",
+    "BackendUnavailableError",
     "BenchmarkHarness",
     "ChatChunk",
     "ChatRequest",
@@ -35,11 +45,15 @@ __all__ = [
     "EvalHarness",
     "FitRecommendation",
     "HardwareProfile",
+    "InvalidRequestError",
     "LocalLLMManager",
     "NeedleHarness",
+    "OmniLLMError",
     "QuantFitResult",
     "QuantFitStatus",
+    "ToolLoopLimitError",
     "ToolRegistry",
+    "UnsupportedFeatureError",
     "Usage",
     "detect_hardware",
     "estimate_model_memory",

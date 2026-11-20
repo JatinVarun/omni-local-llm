@@ -151,7 +151,7 @@ def _handle_bench(args: argparse.Namespace, manager: LocalLLMManager) -> None:
     else:
         targets.append(BenchmarkTarget(backend=args.backend, model=args.model))
 
-    print(f"Running benchmark across {len(targets)} target(s) ({args.runs} runs each)...")
+    print(f"Running benchmark across {len(targets)} target(s) ({args.runs} runs each)...", file=sys.stderr)
     suite = harness.run(
         targets=targets,
         prompt=args.prompt,
@@ -170,7 +170,7 @@ def _handle_eval(args: argparse.Namespace, manager: LocalLLMManager) -> None:
     if args.needle:
         needle_harness = NeedleHarness(manager)
         depths = [int(d.strip()) for d in args.depths.split(",")] if args.depths else (0, 25, 50, 75, 100)
-        print(f"Running Needle in a Haystack evaluation on {args.backend}/{args.model}...")
+        print(f"Running Needle in a Haystack evaluation on {args.backend}/{args.model}...", file=sys.stderr)
         result = needle_harness.run(
             backend=args.backend,
             model=args.model,
@@ -203,7 +203,7 @@ def _handle_eval(args: argparse.Namespace, manager: LocalLLMManager) -> None:
             ),
         ]
 
-    print(f"Running evaluation suite ({len(test_cases)} tests) on {args.backend}/{args.model}...")
+    print(f"Running evaluation suite ({len(test_cases)} tests) on {args.backend}/{args.model}...", file=sys.stderr)
     suite_result = eval_harness.run_suite(backend=args.backend, model=args.model, test_cases=test_cases)
 
     if args.json:

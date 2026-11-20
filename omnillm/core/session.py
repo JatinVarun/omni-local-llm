@@ -2,6 +2,7 @@ from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Literal, overload
 
+from omnillm.core.errors import ToolLoopLimitError
 from omnillm.core.types import ChatChunk, ChatMessage, ChatResponse, ToolCall
 
 if TYPE_CHECKING:
@@ -94,41 +95,14 @@ class ChatSession:
             turns.append(current_turn)
         return turns
 
-    def _prune_history(self) -> None:
-        if self.strategy != "sliding_window" or not self.messages:
-            return
+    def _window(self, messages: Sequence[ChatMessage]) -> list[ChatMessage]:
+        """Applies the sliding-window turn/token limits, always keeping the system prompt and the latest turn."""
+        if self.strategy != "sliding_window" or not messages:
+            return list(messages)
 
-        has_system = self.messages[0].get("role") == "system"
-        system_msg = [self.messages[0]] if has_system else []
-        non_system = self.messages[1:] if has_system else self.messages[:]
-
-        if not non_system:
-            return
-
-        turns = self._group_turns(non_system)
-
-        if self.max_turns is not None and len(turns) > self.max_turns:
-            turns = turns[-self.max_turns :]
-
-        if self.max_tokens_budget is not None:
-            while (
-                len(turns) > 1
-                and self._estimate_tokens(system_msg + [m for t in turns for m in t]) > self.max_tokens_budget
-            ):
-                turns.pop(0)
-
-        self.messages = system_msg + [m for t in turns for m in t]
-
-    def _prepare_messages(self, user_message: ChatMessage) -> list[ChatMessage]:
-        if self.strategy != "sliding_window":
-            return [*self.messages, user_message]
-
-        candidate = [*self.messages, user_message]
-        has_system = candidate[0].get("role") == "system"
-        system_msg = [candidate[0]] if has_system else []
-        non_system = candidate[1:] if has_system else candidate[:]
-
-        turns = self._group_turns(non_system)
+        has_system = messages[0].get("role") == "system"
+        system_msg = [messages[0]] if has_system else []
+        turns = self._group_turns(messages[1:] if has_system else messages)
 
         if self.max_turns is not None and len(turns) > self.max_turns:
             turns = turns[-self.max_turns :]
@@ -142,13 +116,33 @@ class ChatSession:
 
         return system_msg + [m for t in turns for m in t]
 
-    def _commit(self, user_message: ChatMessage, content: str, tool_calls: Sequence[ToolCall]) -> None:
-        self.messages.append(user_message)
-        assistant: ChatMessage = {"role": "assistant", "content": content}
+    def _prune_history(self) -> None:
+        self.messages = self._window(self.messages)
+
+    def _prepare_messages(self, user_message: ChatMessage) -> list[ChatMessage]:
+        return self._window([*self.messages, user_message])
+
+    @staticmethod
+    def _user_message(user_input: str, images: Sequence[str | bytes | Any] | None) -> ChatMessage:
+        message: ChatMessage = {"role": "user", "content": user_input}
+        if images:
+            message["images"] = list(images)
+        return message
+
+    @staticmethod
+    def _assistant_message(content: str, tool_calls: Sequence[ToolCall]) -> ChatMessage:
+        message: ChatMessage = {"role": "assistant", "content": content}
         if tool_calls:
-            assistant["tool_calls"] = list(tool_calls)
-        self.messages.append(assistant)
+            message["tool_calls"] = list(tool_calls)
+        return message
+
+    def _commit_turn(self, user_message: ChatMessage, produced: Sequence[ChatMessage]) -> None:
+        self.messages.append(user_message)
+        self.messages.extend(produced)
         self._prune_history()
+
+    def _commit(self, user_message: ChatMessage, content: str, tool_calls: Sequence[ToolCall]) -> None:
+        self._commit_turn(user_message, [self._assistant_message(content, tool_calls)])
 
     @overload
     def send(
@@ -205,9 +199,7 @@ class ChatSession:
         **options: Any,
     ) -> ChatResponse | Iterator[str]:
         self._claim_turn()
-        user_message: ChatMessage = {"role": "user", "content": user_input}
-        if images:
-            user_message["images"] = list(images)
+        user_message = self._user_message(user_input, images)
         messages = self._prepare_messages(user_message)
         try:
             result = self.manager.chat(
@@ -308,9 +300,7 @@ class ChatSession:
         **options: Any,
     ) -> ChatResponse | AsyncIterator[str]:
         self._claim_turn()
-        user_message: ChatMessage = {"role": "user", "content": user_input}
-        if images:
-            user_message["images"] = list(images)
+        user_message = self._user_message(user_input, images)
         messages = self._prepare_messages(user_message)
         try:
             result = await self.manager.achat(
@@ -385,6 +375,26 @@ class ChatSession:
             if system_prompt:
                 self.messages.append({"role": "system", "content": system_prompt})
 
+    @staticmethod
+    def _unpack_tool_call(call: ToolCall, step: int, position: int) -> tuple[str, str, Any]:
+        function = call.get("function", {})
+        if not isinstance(function, dict):
+            function = {}
+        call_id = call.get("id") or f"call_{step}_{position}"
+        return call_id, function.get("name", "") or "", function.get("arguments", "{}")
+
+    @staticmethod
+    def _tool_message(call_id: str, name: str, content: str) -> ChatMessage:
+        return {"role": "tool", "tool_call_id": call_id, "name": name, "content": content}
+
+    def _loop_limit_error(self, max_steps: int, response: ChatResponse, produced: list[ChatMessage]) -> Exception:
+        return ToolLoopLimitError(
+            f"The model still requested tools after {max_steps} steps; the turn was not committed. "
+            "Increase max_steps or simplify the task.",
+            response=response,
+            messages=produced,
+        )
+
     def act(
         self,
         user_input: str,
@@ -394,60 +404,49 @@ class ChatSession:
         images: Sequence[str | bytes | Any] | None = None,
         **options: Any,
     ) -> ChatResponse:
-        """Executes an autonomous tool-calling loop: sends prompt, executes tool calls,
+        """Executes an autonomous tool-calling loop: sends the prompt, executes tool calls,
 
         feeds observations back to the model, and returns the final answer.
+
+        `max_steps` bounds the number of model calls. The whole exchange is committed to history only when
+        the model produces a final answer; if the budget runs out first, `ToolLoopLimitError` is raised.
         """
         from omnillm.core.tools import ToolRegistry
 
+        if max_steps < 1:
+            raise ValueError("max_steps must be at least 1.")
         registry = ToolRegistry(tools)
-        response = self.send(
-            user_input,
-            images=images,
-            tools=registry.schemas,
-            stream=False,
-            **options,
-        )
 
-        step = 1
-        while response.tool_calls and step < max_steps:
-            step += 1
-            for call in response.tool_calls:
-                func_info = call.get("function", {})
-                name = func_info.get("name", "") if isinstance(func_info, dict) else ""
-                args = func_info.get("arguments", "{}") if isinstance(func_info, dict) else "{}"
-                call_id = call.get("id") or f"call_{step}"
-                result_str = registry.execute(name, args)
-                tool_msg: ChatMessage = {
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "name": name,
-                    "content": result_str,
-                }
-                self.messages.append(tool_msg)
-
-            self._claim_turn()
-            try:
-                next_result = self.manager.chat(
+        self._claim_turn()
+        try:
+            user_message = self._user_message(user_input, images)
+            context = self._prepare_messages(user_message)
+            produced: list[ChatMessage] = []
+            response = ChatResponse()
+            for step in range(1, max_steps + 1):
+                result = self.manager.chat(
                     self.backend,
                     self.model,
-                    self.messages,
+                    [*context, *produced],
                     tools=registry.schemas,
                     stream=False,
                     **options,
                 )
-                if not isinstance(next_result, ChatResponse):
+                if not isinstance(result, ChatResponse):
                     raise RuntimeError("Backend returned a stream during autonomous tool execution.")
-                assistant_msg: ChatMessage = {"role": "assistant", "content": next_result.content}
-                if next_result.tool_calls:
-                    assistant_msg["tool_calls"] = list(next_result.tool_calls)
-                self.messages.append(assistant_msg)
-                self._prune_history()
-                response = next_result
-            finally:
-                self._release_turn()
-
-        return response
+                response = result
+                produced.append(self._assistant_message(response.content, response.tool_calls))
+                if not response.tool_calls:
+                    self._commit_turn(user_message, produced)
+                    return response
+                if step == max_steps:
+                    break
+                for position, call in enumerate(response.tool_calls):
+                    call_id, name, arguments = self._unpack_tool_call(call, step, position)
+                    produced.append(self._tool_message(call_id, name, registry.execute(name, arguments)))
+            raise self._loop_limit_error(max_steps, response, produced)
+        finally:
+            self._release_turn()
 
     async def aact(
         self,
@@ -458,54 +457,40 @@ class ChatSession:
         images: Sequence[str | bytes | Any] | None = None,
         **options: Any,
     ) -> ChatResponse:
-        """Executes an asynchronous autonomous tool-calling loop."""
+        """Asynchronous version of `act`."""
         from omnillm.core.tools import ToolRegistry
 
+        if max_steps < 1:
+            raise ValueError("max_steps must be at least 1.")
         registry = ToolRegistry(tools)
-        response = await self.asend(
-            user_input,
-            images=images,
-            tools=registry.schemas,
-            stream=False,
-            **options,
-        )
 
-        step = 1
-        while response.tool_calls and step < max_steps:
-            step += 1
-            for call in response.tool_calls:
-                func_info = call.get("function", {})
-                name = func_info.get("name", "") if isinstance(func_info, dict) else ""
-                args = func_info.get("arguments", "{}") if isinstance(func_info, dict) else "{}"
-                call_id = call.get("id") or f"call_{step}"
-                result_str = await registry.aexecute(name, args)
-                tool_msg: ChatMessage = {
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "name": name,
-                    "content": result_str,
-                }
-                self.messages.append(tool_msg)
-
-            self._claim_turn()
-            try:
-                next_result = await self.manager.achat(
+        self._claim_turn()
+        try:
+            user_message = self._user_message(user_input, images)
+            context = self._prepare_messages(user_message)
+            produced: list[ChatMessage] = []
+            response = ChatResponse()
+            for step in range(1, max_steps + 1):
+                result = await self.manager.achat(
                     self.backend,
                     self.model,
-                    self.messages,
+                    [*context, *produced],
                     tools=registry.schemas,
                     stream=False,
                     **options,
                 )
-                if not isinstance(next_result, ChatResponse):
+                if not isinstance(result, ChatResponse):
                     raise RuntimeError("Backend returned a stream during autonomous tool execution.")
-                assistant_msg: ChatMessage = {"role": "assistant", "content": next_result.content}
-                if next_result.tool_calls:
-                    assistant_msg["tool_calls"] = list(next_result.tool_calls)
-                self.messages.append(assistant_msg)
-                self._prune_history()
-                response = next_result
-            finally:
-                self._release_turn()
-
-        return response
+                response = result
+                produced.append(self._assistant_message(response.content, response.tool_calls))
+                if not response.tool_calls:
+                    self._commit_turn(user_message, produced)
+                    return response
+                if step == max_steps:
+                    break
+                for position, call in enumerate(response.tool_calls):
+                    call_id, name, arguments = self._unpack_tool_call(call, step, position)
+                    produced.append(self._tool_message(call_id, name, await registry.aexecute(name, arguments)))
+            raise self._loop_limit_error(max_steps, response, produced)
+        finally:
+            self._release_turn()

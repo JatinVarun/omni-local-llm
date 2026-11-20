@@ -181,3 +181,108 @@ def test_multimodal_chat_completions():
     assert response.json()["choices"][0]["message"]["content"] == "I see a cat."
     assert len(backend.requests[0].messages) == 1
     assert isinstance(backend.requests[0].messages[0]["content"], list)
+
+
+def test_server_never_reads_local_files_named_in_images(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "abcd").write_bytes(b"top secret")
+    backend = RecordingBackend(response=ChatResponse(content="ok"))
+    client = make_client(backend)
+
+    rejected = client.post(
+        "/v1/chat/completions",
+        json={"model": "fake/m", "messages": [{"role": "user", "content": "x", "images": [str(tmp_path / "abcd")]}]},
+    )
+    accepted = client.post(
+        "/v1/chat/completions",
+        json={"model": "fake/m", "messages": [{"role": "user", "content": "x", "images": ["abcd"]}]},
+    )
+    remote = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake/m",
+            "messages": [
+                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "http://169.254.169.254/"}}]}
+            ],
+        },
+    )
+
+    assert rejected.status_code == 400
+    assert remote.status_code == 400
+    assert accepted.status_code == 200
+    assert len(backend.requests) == 1
+    assert backend.requests[0].messages[0]["images"] == ["data:image/jpeg;base64,abcd"]
+
+
+def test_server_forwards_llamacpp_model_source_and_seed():
+    backend = RecordingBackend(response=ChatResponse(content="ok"))
+    client = make_client(backend)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake/owner/repo-GGUF",
+            "messages": [{"role": "user", "content": "hi"}],
+            "filename": "model-Q4_K_M.gguf",
+            "mmproj_filename": "mmproj.gguf",
+            "seed": 42,
+            "max_completion_tokens": 9,
+        },
+    )
+
+    assert response.status_code == 200
+    request = backend.requests[0]
+    assert request.model == "owner/repo-GGUF"
+    assert request.model_source.filename == "model-Q4_K_M.gguf"
+    assert request.model_source.mmproj_filename == "mmproj.gguf"
+    assert request.seed == 42
+    assert request.max_tokens == 9
+
+
+def test_server_tool_choice_none_drops_tools_and_forced_choice_is_rejected():
+    backend = RecordingBackend(response=ChatResponse(content="ok"))
+    client = make_client(backend)
+    tools = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
+    base = {"model": "fake/m", "messages": [{"role": "user", "content": "hi"}], "tools": tools}
+
+    none = client.post("/v1/chat/completions", json={**base, "tool_choice": "none"})
+    auto = client.post("/v1/chat/completions", json={**base, "tool_choice": "auto"})
+    required = client.post("/v1/chat/completions", json={**base, "tool_choice": "required"})
+
+    assert none.status_code == 200 and backend.requests[0].tools is None
+    assert auto.status_code == 200 and backend.requests[1].tools == tools
+    assert required.status_code == 400
+    assert "tool_choice" in required.json()["error"]["message"]
+
+
+def test_streaming_tool_calls_have_indexes_finish_reason_and_optional_usage():
+    call = {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+    backend = RecordingBackend(
+        chunks=(
+            ChatChunk(tool_calls=(call,)),
+            ChatChunk(finish_reason="stop", usage=Usage(5, 3)),
+        )
+    )
+    client = make_client(backend)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake/m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        },
+    )
+
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    tool_delta = events[1]["choices"][0]["delta"]["tool_calls"][0]
+    assert tool_delta["index"] == 0
+    assert tool_delta["id"] == "call_1"
+    assert events[-2]["choices"][0]["finish_reason"] == "tool_calls"
+    assert events[-1]["choices"] == []
+    assert events[-1]["usage"] == {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}

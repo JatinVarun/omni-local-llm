@@ -5,6 +5,7 @@ from typing import Any
 from omnillm.core.base import LLMBackend
 from omnillm.core.errors import BackendUnavailableError
 from omnillm.core.media import normalize_messages_for_ollama
+from omnillm.core.tool_calls import to_openai_tool_call
 from omnillm.core.types import (
     ChatChunk,
     ChatRequest,
@@ -33,16 +34,6 @@ def _value(value: Any, key: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
         return value.get(key, default)
     return getattr(value, key, default)
-
-
-def _as_dict(value: Any) -> dict[str, Any]:
-    if isinstance(value, Mapping):
-        return dict(value)
-    if hasattr(value, "model_dump"):
-        return value.model_dump()
-    if hasattr(value, "dict"):
-        return value.dict()
-    return {"value": value}
 
 
 class OllamaAdapter(LLMBackend):
@@ -99,6 +90,7 @@ class OllamaAdapter(LLMBackend):
                 "num_predict": request.max_tokens,
                 "top_p": request.top_p,
                 "stop": request.stop,
+                "seed": request.seed,
             }.items()
             if value is not None
         }
@@ -127,12 +119,19 @@ class OllamaAdapter(LLMBackend):
 
     @staticmethod
     def _finish_reason(response: Any) -> FinishReason:
-        return "tool_calls" if _value(response, "done_reason") == "tool_calls" else "stop"
+        done_reason = _value(response, "done_reason")
+        if done_reason in {"tool_calls", "length"}:
+            return done_reason
+        return "stop"
+
+    @staticmethod
+    def _tool_calls(message: Any) -> tuple[dict[str, Any], ...]:
+        return tuple(to_openai_tool_call(call) for call in (_value(message, "tool_calls", []) or []))
 
     @classmethod
     def _response(cls, response: Any) -> ChatResponse:
         message = _value(response, "message", {})
-        tool_calls = tuple(_as_dict(call) for call in (_value(message, "tool_calls", []) or []))
+        tool_calls = cls._tool_calls(message)
         return ChatResponse(
             content=_value(message, "content", "") or "",
             tool_calls=tool_calls,
@@ -143,11 +142,12 @@ class OllamaAdapter(LLMBackend):
     @classmethod
     def _chunk(cls, response: Any) -> ChatChunk:
         message = _value(response, "message", {})
-        tool_calls = tuple(_as_dict(call) for call in (_value(message, "tool_calls", []) or []))
+        done = bool(_value(response, "done"))
         return ChatChunk(
             content=_value(message, "content", "") or "",
-            tool_calls=tool_calls,
-            finish_reason=cls._finish_reason(response) if _value(response, "done") else None,
+            tool_calls=cls._tool_calls(message),
+            finish_reason=cls._finish_reason(response) if done else None,
+            usage=cls._usage(response) if done else None,
         )
 
     def chat(self, request: ChatRequest) -> ChatResponse | Iterator[ChatChunk]:

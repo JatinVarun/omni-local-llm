@@ -1,10 +1,13 @@
 import asyncio
+import threading
+import weakref
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from typing import Any
 
 from omnillm.core.base import LLMBackend
 from omnillm.core.errors import BackendUnavailableError, InvalidRequestError
 from omnillm.core.media import normalize_messages_for_openai
+from omnillm.core.tool_calls import to_openai_tool_call
 from omnillm.core.types import (
     ChatChunk,
     ChatRequest,
@@ -56,8 +59,93 @@ def _finish_reason(value: Any) -> FinishReason:
     return "stop"
 
 
+class _Lease:
+    """Releases a held lock exactly once, however the holder finishes (completion, error, close, or GC)."""
+
+    def __init__(self, release: Callable[[], None]):
+        self._release = release
+        self._held = True
+
+    def release(self) -> None:
+        if self._held:
+            self._held = False
+            self._release()
+
+
+class _LeasedStream(Iterator[ChatChunk]):
+    """A chunk iterator that keeps the model lease until it is exhausted, fails, or is closed/collected."""
+
+    def __init__(self, source: Iterator[Any], lease: _Lease, convert: Callable[[Any], ChatChunk]):
+        self._source = source
+        self._lease = lease
+        self._convert = convert
+
+    def __next__(self) -> ChatChunk:
+        try:
+            return self._convert(next(self._source))
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        try:
+            close = getattr(self._source, "close", None)
+            if callable(close):
+                close()
+        finally:
+            self._lease.release()
+
+    def __del__(self) -> None:
+        self._lease.release()
+
+
+class _AsyncLeasedStream(AsyncIterator[ChatChunk]):
+    """Async view of a leased sync stream; holds the async lease until exhausted, failed, or closed/collected."""
+
+    def __init__(self, source: Iterator[ChatChunk], lease: _Lease):
+        self._source = source
+        self._lease = lease
+
+    @staticmethod
+    def _next_or_none(iterator: Iterator[ChatChunk]) -> ChatChunk | None:
+        try:
+            return next(iterator)
+        except StopIteration:
+            return None
+
+    async def __anext__(self) -> ChatChunk:
+        try:
+            chunk = await asyncio.to_thread(self._next_or_none, self._source)
+        except BaseException:
+            await self.aclose()
+            raise
+        if chunk is None:
+            await self.aclose()
+            raise StopAsyncIteration
+        return chunk
+
+    async def aclose(self) -> None:
+        try:
+            close = getattr(self._source, "close", None)
+            if callable(close):
+                await asyncio.to_thread(close)
+        finally:
+            self._lease.release()
+
+    def __del__(self) -> None:
+        close = getattr(self._source, "close", None)
+        if callable(close):
+            close()
+        self._lease.release()
+
+
 class LlamaCPPAdapter(LLMBackend):
-    """Adapter for llama.cpp with one cached in-process model."""
+    """Adapter for llama.cpp with one cached in-process model.
+
+    A llama.cpp model instance is not thread-safe, so requests are serialized: one generation (including a
+    stream, until it is exhausted or closed) runs at a time. Async callers wait on the event loop rather
+    than occupying worker threads.
+    """
 
     def __init__(
         self,
@@ -68,6 +156,35 @@ class LlamaCPPAdapter(LLMBackend):
         self._hub_download = hub_download if hub_download is not None else hf_hub_download
         self._active_key: tuple[str, ModelSource, bool, str | None] | None = None
         self._llm: Any | None = None
+        self._lock = threading.Lock()
+        self._owner: int | None = None
+        self._async_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
+            weakref.WeakKeyDictionary()
+        )
+
+    def _acquire(self, track_owner: bool) -> _Lease:
+        if not self._lock.acquire(blocking=False):
+            if track_owner and self._owner == threading.get_ident():
+                raise RuntimeError(
+                    "The llama.cpp model is busy with an unfinished stream in this thread. "
+                    "Consume or close() the previous stream before starting another request."
+                )
+            self._lock.acquire()
+        self._owner = threading.get_ident() if track_owner else None
+
+        def release() -> None:
+            self._owner = None
+            self._lock.release()
+
+        return _Lease(release)
+
+    async def _acquire_async(self) -> _Lease:
+        loop = asyncio.get_running_loop()
+        lock = self._async_locks.get(loop)
+        if lock is None:
+            lock = self._async_locks[loop] = asyncio.Lock()
+        await lock.acquire()
+        return _Lease(lock.release)
 
     def _require_dependencies(self) -> tuple[Callable[..., Any], Callable[..., str]]:
         if self._llama_factory is None or self._hub_download is None:
@@ -147,6 +264,7 @@ class LlamaCPPAdapter(LLMBackend):
             "max_tokens": request.max_tokens,
             "top_p": request.top_p,
             "stop": request.stop,
+            "seed": request.seed,
         }.items():
             if value is not None:
                 kwargs[key] = value
@@ -173,7 +291,7 @@ class LlamaCPPAdapter(LLMBackend):
     def _response(cls, response: Any) -> ChatResponse:
         choice = _value(response, "choices", [])[0]
         message = _value(choice, "message", {})
-        tool_calls = tuple(_as_dict(call) for call in (_value(message, "tool_calls", []) or []))
+        tool_calls = tuple(to_openai_tool_call(call) for call in (_value(message, "tool_calls", []) or []))
         return ChatResponse(
             content=_value(message, "content", "") or "",
             tool_calls=tool_calls,
@@ -185,54 +303,55 @@ class LlamaCPPAdapter(LLMBackend):
     def _chunk(response: Any) -> ChatChunk:
         choice = _value(response, "choices", [])[0]
         delta = _value(choice, "delta", {})
+        # Streaming tool-call deltas are partial (index + fragments), so they are passed through untouched.
         tool_calls = tuple(_as_dict(call) for call in (_value(delta, "tool_calls", []) or []))
         finish_reason = _value(choice, "finish_reason")
         return ChatChunk(
             content=_value(delta, "content", "") or "",
             tool_calls=tool_calls,
             finish_reason=_finish_reason(finish_reason) if finish_reason is not None else None,
+            usage=LlamaCPPAdapter._usage(response),
         )
 
-    def chat(self, request: ChatRequest) -> ChatResponse | Iterator[ChatChunk]:
-        response = self._load_model(request).create_chat_completion(**self._chat_kwargs(request))
+    def _chat(self, request: ChatRequest, *, track_owner: bool) -> ChatResponse | Iterator[ChatChunk]:
+        lease = self._acquire(track_owner)
+        try:
+            response = self._load_model(request).create_chat_completion(**self._chat_kwargs(request))
+        except BaseException:
+            lease.release()
+            raise
         if not request.stream:
+            lease.release()
             return self._response(response)
+        return _LeasedStream(iter(response), lease, self._chunk)
 
-        def stream() -> Iterator[ChatChunk]:
-            for chunk in response:
-                yield self._chunk(chunk)
-
-        return stream()
+    def chat(self, request: ChatRequest) -> ChatResponse | Iterator[ChatChunk]:
+        return self._chat(request, track_owner=True)
 
     async def achat(self, request: ChatRequest) -> ChatResponse | AsyncIterator[ChatChunk]:
-        result = await asyncio.to_thread(self.chat, request)
+        lease = await self._acquire_async()
+        try:
+            result = await asyncio.to_thread(self._chat, request, track_owner=False)
+        except BaseException:
+            lease.release()
+            raise
         if not request.stream:
+            lease.release()
             if not isinstance(result, ChatResponse):
                 raise RuntimeError("llama.cpp returned a stream for a non-streaming request.")
             return result
-
         if not isinstance(result, Iterator):
+            lease.release()
             raise RuntimeError("llama.cpp returned a non-streaming response for a streaming request.")
-        iterator = result
-
-        def next_or_none(iterator: Iterator[ChatChunk]) -> ChatChunk | None:
-            try:
-                return next(iterator)
-            except StopIteration:
-                return None
-
-        async def stream() -> AsyncIterator[ChatChunk]:
-            while True:
-                chunk = await asyncio.to_thread(next_or_none, iterator)
-                if chunk is None:
-                    break
-                yield chunk
-
-        return stream()
+        return _AsyncLeasedStream(result, lease)
 
     def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
-        llm = self._load_model(request, embedding=True)
-        raw_response = llm.create_embedding(input=list(request.input), model=request.model)
+        lease = self._acquire(track_owner=True)
+        try:
+            llm = self._load_model(request, embedding=True)
+            raw_response = llm.create_embedding(input=list(request.input), model=request.model)
+        finally:
+            lease.release()
         raw_data = _value(raw_response, "data", []) or []
         data = [
             EmbeddingData(
@@ -247,7 +366,11 @@ class LlamaCPPAdapter(LLMBackend):
         return EmbeddingResponse(data=data, model=request.model, usage=usage)
 
     async def aembed(self, request: EmbeddingRequest) -> EmbeddingResponse:
-        return await asyncio.to_thread(self.embed, request)
+        lease = await self._acquire_async()
+        try:
+            return await asyncio.to_thread(self.embed, request)
+        finally:
+            lease.release()
 
     def list_models(self) -> list[str]:
         return [self._active_key[0]] if self._active_key else []

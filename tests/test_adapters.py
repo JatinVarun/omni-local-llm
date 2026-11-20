@@ -1,3 +1,7 @@
+import asyncio
+import gc
+import threading
+import time
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
@@ -5,6 +9,7 @@ import pytest
 
 from omnillm.adapters.llamacpp_adapter import LlamaCPPAdapter
 from omnillm.adapters.ollama_adapter import OllamaAdapter
+from omnillm.core.errors import InvalidRequestError
 from omnillm.core.types import ChatRequest, EmbeddingRequest, ModelSource
 
 
@@ -315,3 +320,175 @@ def test_llamacpp_multimodal_normalizes_images_and_downloads_mmproj():
     assert msg["content"][0] == {"type": "text", "text": "Analyze"}
     assert msg["content"][1]["type"] == "image_url"
     assert msg["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+def test_ollama_tool_calls_are_openai_shaped_and_history_round_trips():
+    client = FakeOllamaClient()
+    adapter = OllamaAdapter(client=client)
+    client.chat = lambda **kwargs: (  # type: ignore[method-assign]
+        setattr(client, "chat_kwargs", kwargs)
+        or {"message": {"content": "", "tool_calls": [{"function": {"name": "f", "arguments": {"a": 1}}}]}}
+    )
+
+    response = adapter.chat(ChatRequest(model="m", messages=[{"role": "user", "content": "hi"}]))
+
+    call = response.tool_calls[0]
+    assert call["type"] == "function"
+    assert call["id"].startswith("call_")
+    assert call["function"] == {"name": "f", "arguments": '{"a": 1}'}
+    assert response.finish_reason == "tool_calls"
+
+    # Feeding the OpenAI-shaped call back must give Ollama the object-shaped arguments it requires.
+    adapter.chat(
+        ChatRequest(
+            model="m",
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": call["id"], "name": "f", "content": "2"},
+            ],
+        )
+    )
+    assert client.chat_kwargs is not None
+    sent = client.chat_kwargs["messages"]
+    assert sent[1]["tool_calls"] == [{"function": {"name": "f", "arguments": {"a": 1}}}]
+    assert sent[2]["tool_name"] == "f"
+
+
+def test_ollama_maps_length_finish_reason_seed_and_final_stream_usage():
+    client = FakeOllamaClient()
+    adapter = OllamaAdapter(client=client)
+    client.chat = lambda **kwargs: (  # type: ignore[method-assign]
+        setattr(client, "chat_kwargs", kwargs)
+        or iter(
+            [
+                {"message": {"content": "a"}},
+                {
+                    "message": {"content": "b"},
+                    "done": True,
+                    "done_reason": "length",
+                    "prompt_eval_count": 4,
+                    "eval_count": 2,
+                },
+            ]
+        )
+    )
+
+    chunks = list(adapter.chat(ChatRequest(model="m", messages=[], stream=True, seed=7)))  # type: ignore[arg-type]
+
+    assert client.chat_kwargs is not None and client.chat_kwargs["options"] == {"seed": 7}
+    assert chunks[0].usage is None and chunks[0].finish_reason is None
+    assert chunks[1].finish_reason == "length"
+    assert chunks[1].usage is not None and chunks[1].usage.completion_tokens == 2
+
+
+class ConcurrencyTrackingLlama:
+    """Fake model that records how many generations overlap."""
+
+    def __init__(self, **kwargs: Any):
+        self.lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+
+    def _enter(self) -> None:
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+
+    def _exit(self) -> None:
+        with self.lock:
+            self.active -= 1
+
+    def create_chat_completion(self, **kwargs: Any) -> Any:
+        if not kwargs["stream"]:
+            self._enter()
+            time.sleep(0.02)
+            self._exit()
+            return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+
+        def stream() -> Iterator[dict[str, Any]]:
+            self._enter()
+            try:
+                for token in ("a", "b", "c"):
+                    time.sleep(0.01)
+                    yield {"choices": [{"delta": {"content": token}, "finish_reason": None}]}
+            finally:
+                self._exit()
+
+        return stream()
+
+
+def _llamacpp_with_tracking_model() -> tuple[LlamaCPPAdapter, list[ConcurrencyTrackingLlama]]:
+    models: list[ConcurrencyTrackingLlama] = []
+
+    def factory(**kwargs: Any) -> ConcurrencyTrackingLlama:
+        models.append(ConcurrencyTrackingLlama(**kwargs))
+        return models[-1]
+
+    return LlamaCPPAdapter(llama_factory=factory, hub_download=lambda **_: "/m.gguf"), models
+
+
+def _request(stream: bool = False) -> ChatRequest:
+    return ChatRequest(model="o/m", messages=[], stream=stream, model_source=ModelSource(filename="m.gguf"))
+
+
+def test_llamacpp_serializes_concurrent_requests_including_streams():
+    adapter, models = _llamacpp_with_tracking_model()
+
+    def worker(i: int) -> None:
+        result = adapter.chat(_request(stream=i % 2 == 0))
+        if isinstance(result, Iterator):
+            list(result)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert len(models) == 1
+    assert models[0].max_active == 1
+
+
+def test_llamacpp_unfinished_stream_in_same_thread_raises_instead_of_deadlocking():
+    adapter, _ = _llamacpp_with_tracking_model()
+    stream = adapter.chat(_request(stream=True))
+    assert isinstance(stream, Iterator)
+    next(stream)
+
+    with pytest.raises(RuntimeError, match="unfinished stream"):
+        adapter.chat(_request())
+
+    stream.close()  # type: ignore[attr-defined]
+    assert adapter.chat(_request()).content == "ok"  # type: ignore[union-attr]
+
+
+def test_llamacpp_abandoned_stream_releases_model():
+    adapter, _ = _llamacpp_with_tracking_model()
+    stream = adapter.chat(_request(stream=True))
+    del stream
+    gc.collect()
+
+    assert adapter.chat(_request()).content == "ok"  # type: ignore[union-attr]
+
+
+def test_llamacpp_load_failure_releases_model():
+    adapter = LlamaCPPAdapter(llama_factory=FakeLlama, hub_download=lambda **_: "/m.gguf")
+    with pytest.raises(InvalidRequestError):
+        adapter.chat(ChatRequest(model="o/m", messages=[]))  # missing filename
+    assert adapter.chat(_request()).content == "done"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_llamacpp_async_streams_are_serialized():
+    adapter, models = _llamacpp_with_tracking_model()
+
+    async def consume() -> list[str]:
+        stream = await adapter.achat(_request(stream=True))
+        assert isinstance(stream, AsyncIterator)
+        return [chunk.content async for chunk in stream]
+
+    results = await asyncio.gather(*(consume() for _ in range(4)))
+
+    assert results == [["a", "b", "c"]] * 4
+    assert models[0].max_active == 1
