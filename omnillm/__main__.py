@@ -245,27 +245,17 @@ def _handle_serve(args: argparse.Namespace, manager: LocalLLMManager) -> None:
     uvicorn.run(app, host=args.host, port=args.port)
 
 
-def _handle_fit(args: argparse.Namespace) -> None:
-    from omnillm.core.hardware import (
-        detect_hardware,
-        recommend_model_fit,
-        suggest_models_for_hardware,
-    )
+def _handle_fit(args: argparse.Namespace, manager: LocalLLMManager | None = None) -> None:
+    from omnillm.core.errors import OmniLLMError
+    from omnillm.core.fit import alias_snippet, analyze_model_fit, pull_quant
+    from omnillm.core.hardware import QuantFitStatus, detect_hardware, suggest_models_for_hardware
 
     hardware = detect_hardware()
 
     if not args.model:
         suggestions = suggest_models_for_hardware(hardware)
         if args.json:
-            print(
-                json.dumps(
-                    {
-                        "hardware": hardware.to_dict(),
-                        "suggestions": suggestions,
-                    },
-                    indent=2,
-                )
-            )
+            print(json.dumps({"hardware": hardware.to_dict(), "suggestions": suggestions}, indent=2))
             return
 
         print("🖥️  Detected Hardware Profile")
@@ -284,33 +274,69 @@ def _handle_fit(args: argparse.Namespace) -> None:
             print("Accelerator:  CPU Only (No dedicated GPU detected)")
         print("-" * 78)
         print("\n🚀 Model Compatibility Matrix for Your Machine:")
-        print(f"{'MODEL':<20} {'SIZE':<8} {'FIT TARGET':<26} {'QUANT':<10} {'EST. RAM'}")
+        print(f"{'MODEL':<20} {'SIZE':<8} {'FIT TARGET':<34} {'QUANT':<10} {'EST. MEMORY'}")
         print("-" * 78)
         for s in suggestions:
             target_str = str(s["target"])
+            if target_str == QuantFitStatus.PARTIAL.value:
+                target_str = f"GPU+CPU ({s['n_gpu_layers']} layers on GPU)"
             icon = (
                 "✅"
-                if s["can_fit"] and ("GPU" in target_str or "Metal" in target_str)
+                if s["target"] in (QuantFitStatus.GPU_FULL.value, QuantFitStatus.METAL_UNIFIED.value)
                 else ("⚠️" if s["can_fit"] else "❌")
             )
             print(
-                f"{s['model']:<20} {s['params']:<8} {icon + ' ' + target_str:<26} {s['recommended_quant'] or 'N/A':<10} {s['required_gb']:.2f} GB"
+                f"{s['model']:<20} {s['params']:<8} {icon + ' ' + target_str:<34} {s['recommended_quant'] or 'N/A':<10} {s['required_gb']:.2f} GB"
             )
         print("-" * 78)
-        print("\n💡 Tip: Run 'omnillm fit <model_name>' for a detailed breakdown of a specific model.")
+        print("\n💡 Tip: Run 'omnillm fit <model>' with a Hugging Face repo (e.g. unsloth/Qwen3-8B-GGUF), an installed")
+        print("   Ollama model, a config alias, or a .gguf file for an exact per-quant breakdown.")
         return
 
-    rec = recommend_model_fit(
-        model_name=args.model,
-        context_length=args.context,
-        param_count_b=args.params,
-        hardware=hardware,
-    )
+    try:
+        rec = analyze_model_fit(
+            args.model,
+            context_length=args.context,
+            manager=manager,
+            hardware=hardware,
+            kv_cache_type=getattr(args, "kv_cache", "f16"),
+            offline=getattr(args, "offline", False),
+            param_count_b=args.params,
+        )
+    except (OmniLLMError, ValueError) as error:
+        print(f"❌ {error}", file=sys.stderr)
+        sys.exit(1)
+
+    pull = getattr(args, "pull", False)
+    quant = getattr(args, "quant", None)
+    if not args.json:
+        print("\n" + rec.format_table() + "\n")
+    if not pull:
+        if args.json:
+            print(json.dumps(rec.to_dict(), indent=2))
+        elif rec.source == "huggingface-gguf" and rec.recommended is not None:
+            print(
+                f"⬇️  Download it with: omnillm fit {args.model} --pull"
+                + (f" --context {rec.context_length}" if args.context else "")
+            )
+        return
+
+    try:
+        path, result = pull_quant(
+            rec, quant, progress=lambda name: print(f"⬇️  Downloading {name} ...", file=sys.stderr)
+        )
+    except (OmniLLMError, ValueError) as error:
+        print(f"❌ {error}", file=sys.stderr)
+        sys.exit(1)
 
     if args.json:
-        print(json.dumps(rec.to_dict(), indent=2))
-    else:
-        print("\n" + rec.format_table() + "\n")
+        print(json.dumps({**rec.to_dict(), "downloaded": {"quant": result.quant, "path": str(path)}}, indent=2))
+        return
+    print(f"✅ {result.quant} downloaded to {path}\n")
+    print("Use it:")
+    print(f"  omnillm chat --backend llama.cpp --model {rec.repo} --filename {result.files[0]}\n")
+    print("Or add this alias to omnillm.toml and run `omnillm chat --model <alias>`:\n")
+    print("  " + alias_snippet(rec, result).replace("\n", "\n  ") + "\n")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -392,14 +418,30 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument("--port", type=int, default=8000, help="Port number")
 
     # 7. Fit (Hardware & Quantization Recommender)
-    fit_p = subparsers.add_parser("fit", help="Auto-detect hardware and recommend optimal model quantization")
+    fit_p = subparsers.add_parser(
+        "fit", help="Check which quantization of a model fits this machine (and download it)", parents=[common]
+    )
     fit_p.add_argument(
         "model",
         nargs="?",
         default=None,
-        help="Model name or alias to evaluate (e.g. 'llama-3.1-8b', 'mistral:7b')",
+        help=(
+            "Hugging Face repo (unsloth/Qwen3-8B-GGUF), installed Ollama model (llama3.2:3b), config alias, "
+            ".gguf file, or a name to estimate (llama-3.1-8b)"
+        ),
     )
-    fit_p.add_argument("--context", type=int, default=4096, help="Context window token size (default: 4096)")
+    fit_p.add_argument(
+        "--context", type=int, default=None, help="Context window in tokens (default: alias n_ctx or 4096)"
+    )
+    fit_p.add_argument(
+        "--kv-cache",
+        default="f16",
+        choices=["f16", "q8_0", "q4_0"],
+        help="KV cache type (llama.cpp --cache-type-k/v, Ollama OLLAMA_KV_CACHE_TYPE)",
+    )
+    fit_p.add_argument("--pull", action="store_true", help="Download the recommended GGUF (Hugging Face repos)")
+    fit_p.add_argument("--quant", help="With --pull: download this quant instead of the recommendation (e.g. Q5_K_M)")
+    fit_p.add_argument("--offline", action="store_true", help="Don't query Hugging Face or Ollama; estimate only")
     fit_p.add_argument("--params", type=float, help="Explicit parameter count in billions (overrides auto-detection)")
     fit_p.add_argument("--json", action="store_true", help="Output raw JSON analysis")
 
@@ -435,9 +477,6 @@ def build_manager(args: argparse.Namespace) -> LocalLLMManager:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    if args.subcommand == "fit":
-        _handle_fit(args)
-        return
     try:
         manager = build_manager(args)
     except ConfigError as error:
@@ -456,6 +495,8 @@ def main() -> None:
         _handle_eval(args, manager)
     elif args.subcommand == "serve":
         _handle_serve(args, manager)
+    elif args.subcommand == "fit":
+        _handle_fit(args, manager)
     else:
         # Fallback to chat if --model was provided at top-level
         if getattr(args, "model", None):
