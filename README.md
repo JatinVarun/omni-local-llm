@@ -47,6 +47,8 @@ Pass a Hugging Face repo, an installed Ollama model, or a `.gguf` file. `fit` re
 - **MoE aware**: total vs. active parameters, with tips for keeping experts on CPU
 - **`--pull` and `--save-alias`**: download the recommended quant and get a ready-to-run alias
 
+Tested on a 4 GB GTX 1650: predicted VRAM was within 0.09–0.37 GB of measured use (always on the safe side), and every recommended layer count loaded. [See the measurements](docs/fit.md#accuracy).
+
 → [Hardware fit docs](docs/fit.md)
 
 ### 2. One API for every local server

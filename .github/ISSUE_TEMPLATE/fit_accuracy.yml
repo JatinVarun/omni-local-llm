@@ -1,0 +1,47 @@
+name: 📏 fit accuracy report
+description: Share how omnillm fit's predictions compare with real memory use on your hardware
+title: "[fit accuracy]: <GPU> / <model>"
+labels: ["fit-accuracy"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks! Real measurements are the best way to make `omnillm fit` accurate on more hardware.
+
+        **NVIDIA + Ollama:** run the measurement script and paste its table:
+        ```bash
+        git clone https://github.com/matteoespo/omni-local-llm && cd omni-local-llm
+        uv run python scripts/measure_fit_accuracy.py <ollama-model> [...] --contexts 4096,8192
+        ```
+        **Other setups (Apple Silicon, AMD, llama.cpp, vLLM, …):** paste `omnillm fit <model> --context <n>` output and what you actually observed.
+
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware
+      placeholder: "e.g. RTX 3060 12 GB, 32 GB RAM, Ubuntu 24.04"
+    validations:
+      required: true
+
+  - type: input
+    id: runtime
+    attributes:
+      label: Runtime and version
+      placeholder: "e.g. Ollama 0.21.0, llama.cpp b6000, LM Studio 0.3.x"
+    validations:
+      required: true
+
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+      description: The script's table, or fit's prediction plus what you measured (VRAM used, layers offloaded, OOM, speed).
+      render: markdown
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything unusual, e.g. flash attention, KV cache type, other apps using the GPU.
