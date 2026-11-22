@@ -8,77 +8,83 @@ from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from omnillm.core.model_info import (
+    GIB,
+    SOURCE_DESCRIPTIONS,
+    ModelArchitecture,
+    ModelInfo,
+    QuantOption,
+    estimated_architecture,
+    estimated_model_info,
+    quant_bpw,
+    quant_quality,
+)
+
 
 class QuantFitStatus(StrEnum):
     GPU_FULL = "GPU (Full Offload)"
     METAL_UNIFIED = "Metal Unified Memory"
+    PARTIAL = "GPU + CPU (Partial Offload)"
     CPU_RAM = "CPU / System RAM"
     OOM = "Insufficient Memory"
 
 
+#: The standard quantization ladder used when a model's real files are unknown.
 QUANT_SPECS: dict[str, dict[str, Any]] = {
-    "FP16": {
-        "bytes_per_param": 2.00,
-        "quality": "Maximum (Lossless)",
-        "speed": "Fast on high-end GPUs",
-    },
-    "Q8_0": {
-        "bytes_per_param": 1.05,
-        "quality": "Near Lossless (~99.5%)",
-        "speed": "Fast (Minimal overhead)",
-    },
-    "Q6_K": {
-        "bytes_per_param": 0.82,
-        "quality": "Extremely High (>99%)",
-        "speed": "Fast",
-    },
-    "Q5_K_M": {
-        "bytes_per_param": 0.70,
-        "quality": "High Sweet-Spot (~98%)",
-        "speed": "Fast / Highly Balanced",
-    },
-    "Q4_K_M": {
-        "bytes_per_param": 0.58,
-        "quality": "Recommended Standard (~95%)",
-        "speed": "Fastest / Standard",
-    },
-    "Q3_K_M": {
-        "bytes_per_param": 0.48,
-        "quality": "Noticeable Degradation",
-        "speed": "Fast, Smallest Footprint",
-    },
-    "Q2_K": {
-        "bytes_per_param": 0.38,
-        "quality": "High Perplexity Loss",
-        "speed": "Minimal Memory Required",
-    },
+    label: {"bytes_per_param": quant_bpw(label) / 8, "quality": quant_quality(label)}  # type: ignore[operator]
+    for label in ("FP16", "Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q3_K_M", "Q2_K")
+}
+
+#: Bytes per element of llama.cpp KV-cache types (`--cache-type-k/v`, Ollama's OLLAMA_KV_CACHE_TYPE).
+KV_CACHE_BYTES: dict[str, float] = {
+    "f32": 4.0,
+    "f16": 2.0,
+    "bf16": 2.0,
+    "q8_0": 1.0625,
+    "q5_1": 0.75,
+    "q5_0": 0.6875,
+    "q4_1": 0.625,
+    "q4_0": 0.5625,
+    "iq4_nl": 0.5625,
 }
 
 KNOWN_MODEL_SIZES: dict[str, float] = {
-    "llama3": 8.0,
-    "llama-3": 8.0,
-    "llama3.1": 8.0,
-    "llama-3.1": 8.0,
-    "llama3.2": 3.0,
-    "llama-3.2": 3.0,
     "llama3.3": 70.0,
     "llama-3.3": 70.0,
-    "mistral": 7.0,
+    "llama3.2": 3.0,
+    "llama-3.2": 3.0,
+    "llama3.1": 8.0,
+    "llama-3.1": 8.0,
+    "llama3": 8.0,
+    "llama-3": 8.0,
     "mistral-nemo": 12.0,
+    "mistral-small": 24.0,
     "mixtral-8x7b": 46.7,
     "mixtral": 46.7,
+    "mistral": 7.0,
+    "phi-3-mini": 3.8,
     "phi3": 3.8,
     "phi-3": 3.8,
-    "phi-3-mini": 3.8,
+    "phi4-mini": 3.8,
     "phi4": 14.7,
     "phi-4": 14.7,
-    "gemma": 7.0,
+    "gemma3": 4.0,
     "gemma2": 9.0,
     "gemma-2": 9.0,
+    "gemma": 7.0,
     "deepseek-r1": 7.0,
-    "qwen2": 7.0,
+    "qwen3": 8.0,
     "qwen2.5": 7.0,
+    "qwen2": 7.0,
+    "gpt-oss": 20.9,
 }
+
+_USABLE_RAM_FRACTION = 0.95
+_TOTAL_RAM_FRACTION = 0.85
+_METAL_FRACTION = 0.75  # macOS GPU working-set limit for unified memory (default ~2/3-3/4 of RAM)
+_MAX_RECOMMENDED_GPU_BPW = 8.5  # beyond Q8_0 quality gains are negligible for the memory/speed cost
+_MAX_RECOMMENDED_OFFLOAD_BPW = 4.9  # Q4_K_M: the usual sweet spot when weights spill to system RAM
+_MIN_PREFERRED_GPU_BPW = 3.5  # below this, a better quant split across GPU+CPU beats a tiny one on the GPU
 
 
 @dataclass
@@ -121,94 +127,6 @@ class HardwareProfile:
         else:
             parts.append("Accelerator: CPU Inference Only")
         return " | ".join(parts)
-
-
-@dataclass
-class QuantFitResult:
-    quant: str
-    required_memory_gb: float
-    weights_memory_gb: float
-    kv_cache_memory_gb: float
-    status: QuantFitStatus
-    fits: bool
-    quality_description: str
-    speed_description: str
-    notes: str
-
-    def to_dict(self) -> dict[str, Any]:
-        d = asdict(self)
-        d["status"] = self.status.value
-        return d
-
-
-@dataclass
-class FitRecommendation:
-    model_name: str
-    param_count_b: float
-    context_length: int
-    hardware: HardwareProfile
-    results: list[QuantFitResult]
-    can_fit: bool
-    recommended_quant: str | None
-    best_target: QuantFitStatus
-    summary_message: str
-    suggestions: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "model_name": self.model_name,
-            "param_count_b": self.param_count_b,
-            "context_length": self.context_length,
-            "hardware": self.hardware.to_dict(),
-            "results": [r.to_dict() for r in self.results],
-            "can_fit": self.can_fit,
-            "recommended_quant": self.recommended_quant,
-            "best_target": self.best_target.value,
-            "summary_message": self.summary_message,
-            "suggestions": self.suggestions,
-        }
-
-    def format_table(self) -> str:
-        lines: list[str] = []
-        lines.append("🖥️  Detected Hardware Profile")
-        lines.append("-" * 78)
-        lines.append(
-            f"OS:           {self.hardware.os_name} {self.hardware.os_release} ({self.hardware.architecture}, {self.hardware.cpu_count} CPUs)"
-        )
-        lines.append(
-            f"System RAM:   {self.hardware.total_ram_gb:.2f} GB Total ({self.hardware.available_ram_gb:.2f} GB Available)"
-        )
-        if self.hardware.has_cuda and self.hardware.gpu_name:
-            lines.append(
-                f"GPU:          {self.hardware.gpu_name} ({self.hardware.total_vram_gb:.2f} GB VRAM, {self.hardware.free_vram_gb:.2f} GB Free)"
-            )
-        elif self.hardware.is_apple_silicon:
-            lines.append(f"GPU:          {self.hardware.gpu_name or 'Apple Silicon Metal'} (Unified Memory)")
-        else:
-            lines.append("Accelerator:  CPU Only (No dedicated GPU detected)")
-        lines.append("")
-
-        lines.append(
-            f"🧠 Model Fit Analysis: {self.model_name} (~{self.param_count_b:.1f}B params, {self.context_length:,} context)"
-        )
-        lines.append("-" * 78)
-        lines.append(f"{'QUANT':<9} {'SIZE (GB)':<11} {'FIT STATUS':<24} {'QUALITY':<22} {'SPEED'}")
-        lines.append("-" * 78)
-
-        for r in self.results:
-            icon = "✅" if r.fits and r.status != QuantFitStatus.CPU_RAM else ("⚠️" if r.fits else "❌")
-            status_text = f"{icon} {r.status.value}"
-            speed_text = r.speed_description if r.fits else "OOM"
-            lines.append(
-                f"{r.quant:<9} {r.required_memory_gb:>5.2f} GB    {status_text:<24} {r.quality_description:<22} {speed_text}"
-            )
-
-        lines.append("-" * 78)
-        lines.append("\n💡 Recommendation:")
-        lines.append(f"   {self.summary_message}")
-        for s in self.suggestions:
-            lines.append(f"   {s}")
-        return "\n".join(lines)
 
 
 def detect_hardware() -> HardwareProfile:
@@ -333,6 +251,13 @@ def parse_model_parameter_count(model_name: str) -> float | None:
     """Infers the parameter count in billions from common model names or aliases."""
     name = model_name.lower().strip()
 
+    # Explicit MoE patterns: e.g. "8x7b"
+    moe_match = re.search(r"(\d+)x(\d+(?:\.\d+)?)[bB]", name)
+    if moe_match:
+        count = int(moe_match.group(1))
+        size = float(moe_match.group(2))
+        return count * size * 0.83  # Shared embedding and active expert factor
+
     # Explicit billion patterns: e.g. "8b", "70b", "3.8b", "0.5b"
     b_match = re.search(r"(?:^|[-_:a-zA-Z])(\d+(?:\.\d+)?)[bB](?:[-_:]|$)", name)
     if b_match:
@@ -343,13 +268,6 @@ def parse_model_parameter_count(model_name: str) -> float | None:
     if m_match:
         return float(m_match.group(1)) / 1000.0
 
-    # Explicit MoE patterns: e.g. "8x7b"
-    moe_match = re.search(r"(\d+)x(\d+(?:\.\d+)?)[bB]", name)
-    if moe_match:
-        count = int(moe_match.group(1))
-        size = float(moe_match.group(2))
-        return count * size * 0.83  # Shared embedding and active expert factor
-
     # Fallback to known lookup
     for key, size in KNOWN_MODEL_SIZES.items():
         if key in name:
@@ -358,28 +276,237 @@ def parse_model_parameter_count(model_name: str) -> float | None:
     return None
 
 
+def estimate_kv_cache_gb(architecture: ModelArchitecture, context_length: int, kv_cache_type: str = "f16") -> float:
+    """KV-cache size: 2 tensors x layers x KV heads x head dim x context (GQA/MLA aware). Sliding-window layers
+    (Gemma 2/3, gpt-oss) need less in practice, so this errs on the safe side."""
+    try:
+        bytes_per_element = KV_CACHE_BYTES[kv_cache_type.lower()]
+    except KeyError as error:
+        raise ValueError(f"Unknown KV cache type '{kv_cache_type}'. Choose from {sorted(KV_CACHE_BYTES)}.") from error
+    return architecture.kv_bytes_per_token(bytes_per_element) * context_length / GIB
+
+
+def estimate_overhead_gb(architecture: ModelArchitecture, context_length: int) -> float:
+    """Runtime context plus compute buffers; grows with context and hidden size."""
+    hidden = architecture.n_embd or 4096
+    return 0.30 + 0.15 + 0.02 * (context_length / 1024) * (hidden / 4096)
+
+
 def estimate_model_memory(
     param_count_b: float,
     quant: str = "Q4_K_M",
     context_length: int = 4096,
+    *,
+    architecture: ModelArchitecture | None = None,
+    kv_cache_type: str = "f16",
 ) -> tuple[float, float, float]:
-    """Estimates the required memory (total, weights, kv_cache) in GB for a given model, quantization, and context."""
-    spec = QUANT_SPECS.get(quant.upper(), QUANT_SPECS["Q4_K_M"])
-    bytes_per_param = spec["bytes_per_param"]
+    """Estimates (total, weights, kv_cache) memory in GB for a model size, quantization, and context."""
+    arch = architecture or estimated_architecture(param_count_b)
+    bpw = quant_bpw(quant) or quant_bpw("Q4_K_M") or 4.85
+    weights_gb = param_count_b * 1e9 * bpw / 8 / GIB
+    kv_gb = estimate_kv_cache_gb(arch, context_length, kv_cache_type)
+    total_gb = weights_gb + kv_gb + estimate_overhead_gb(arch, context_length)
+    return round(total_gb, 2), round(weights_gb, 2), round(kv_gb, 2)
 
-    # 1. Weights memory (GB)
-    weights_gb = param_count_b * bytes_per_param
 
-    # 2. KV Cache memory approximation (GB)
-    # Scaled by parameter size & context window
-    kv_base_factor = 0.5 * (param_count_b / 8.0)
-    kv_cache_gb = max(0.15, kv_base_factor * (context_length / 4096.0))
+@dataclass
+class QuantFitResult:
+    quant: str
+    required_memory_gb: float
+    weights_memory_gb: float
+    kv_cache_memory_gb: float
+    status: QuantFitStatus
+    fits: bool
+    quality_description: str
+    speed_description: str
+    notes: str
+    overhead_memory_gb: float = 0.0
+    n_gpu_layers: int | None = None
+    bits_per_weight: float | None = None
+    files: tuple[str, ...] = ()
+    installed: bool = False
+    size_exact: bool = False
+    warning: str = ""
 
-    # 3. Runtime activation & CUDA context overhead
-    runtime_overhead_gb = 0.40
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["status"] = self.status.value
+        d["files"] = list(self.files)
+        return d
 
-    total_gb = weights_gb + kv_cache_gb + runtime_overhead_gb
-    return round(total_gb, 2), round(weights_gb, 2), round(kv_cache_gb, 2)
+
+@dataclass
+class _Placement:
+    status: QuantFitStatus
+    fits: bool
+    n_gpu_layers: int | None
+    notes: str
+    warning: str = ""
+
+
+def _usable_vram_gb(hardware: HardwareProfile) -> float:
+    if not hardware.has_cuda:
+        return 0.0
+    if hardware.free_vram_gb > 0:
+        return hardware.free_vram_gb * 0.95
+    return hardware.total_vram_gb * 0.90
+
+
+def plan_placement(
+    weights_gb: float, kv_gb: float, overhead_gb: float, n_layers: int, hardware: HardwareProfile
+) -> _Placement:
+    """Decides where a model runs: fully on GPU, Metal, split GPU/CPU (with a layer count), CPU, or not at all."""
+    total = weights_gb + kv_gb + overhead_gb
+    vram = _usable_vram_gb(hardware)
+    ram_free = hardware.available_ram_gb * _USABLE_RAM_FRACTION
+    ram_max = max(ram_free, hardware.total_ram_gb * _TOTAL_RAM_FRACTION)
+
+    def tight(needed: float) -> str:
+        if needed <= ram_free:
+            return ""
+        return f"Needs {needed:.1f} GB of RAM but only {hardware.available_ram_gb:.1f} GB is free now; close other apps first."
+
+    if hardware.has_cuda and total <= vram:
+        return _Placement(QuantFitStatus.GPU_FULL, True, -1, "Fits entirely in GPU VRAM.")
+    if hardware.is_apple_silicon and total <= hardware.total_ram_gb * _METAL_FRACTION:
+        return _Placement(QuantFitStatus.METAL_UNIFIED, True, -1, "Fits in Apple Silicon unified memory.")
+
+    if hardware.has_cuda and vram > overhead_gb and n_layers > 1:
+        per_layer = (weights_gb + kv_gb) / n_layers
+        gpu_layers = min(int((vram - overhead_gb) // per_layer), n_layers - 1)
+        cpu_gb = (weights_gb + kv_gb) - gpu_layers * per_layer
+        if gpu_layers >= 1 and cpu_gb <= ram_max:
+            return _Placement(
+                QuantFitStatus.PARTIAL,
+                True,
+                gpu_layers,
+                f"{gpu_layers}/{n_layers} layers on GPU, {cpu_gb:.1f} GB in system RAM.",
+                tight(cpu_gb),
+            )
+
+    if total <= ram_max:
+        return _Placement(QuantFitStatus.CPU_RAM, True, 0, "Runs from system RAM.", tight(total))
+    return _Placement(QuantFitStatus.OOM, False, None, "Exceeds available memory.")
+
+
+def _speed(status: QuantFitStatus, architecture: ModelArchitecture, n_gpu_layers: int | None) -> str:
+    moe = architecture.is_moe
+    if status in (QuantFitStatus.GPU_FULL, QuantFitStatus.METAL_UNIFIED):
+        return "Fast"
+    if status == QuantFitStatus.PARTIAL:
+        share = (n_gpu_layers or 0) / max(architecture.n_layers, 1)
+        return "Good (MoE)" if moe else ("Medium" if share >= 0.5 else "Slow-medium")
+    if status == QuantFitStatus.CPU_RAM:
+        return "Medium (MoE on CPU)" if moe else "Slow (CPU)"
+    return "-"
+
+
+@dataclass
+class FitRecommendation:
+    model_name: str
+    param_count_b: float
+    context_length: int
+    hardware: HardwareProfile
+    results: list[QuantFitResult]
+    can_fit: bool
+    recommended_quant: str | None
+    best_target: QuantFitStatus
+    summary_message: str
+    suggestions: list[str] = field(default_factory=list)
+    architecture: ModelArchitecture | None = None
+    source: str = "estimated"
+    kv_cache_type: str = "f16"
+    repo: str | None = None
+    revision: str = "main"
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def recommended(self) -> QuantFitResult | None:
+        return next((r for r in self.results if r.quant == self.recommended_quant), None)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model_name": self.model_name,
+            "param_count_b": self.param_count_b,
+            "context_length": self.context_length,
+            "kv_cache_type": self.kv_cache_type,
+            "source": self.source,
+            "repo": self.repo,
+            "architecture": self.architecture.to_dict() if self.architecture else None,
+            "hardware": self.hardware.to_dict(),
+            "results": [r.to_dict() for r in self.results],
+            "can_fit": self.can_fit,
+            "recommended_quant": self.recommended_quant,
+            "recommended": self.recommended.to_dict() if self.recommended else None,
+            "best_target": self.best_target.value,
+            "summary_message": self.summary_message,
+            "suggestions": self.suggestions,
+            "notes": self.notes,
+        }
+
+    def format_table(self) -> str:
+        hw = self.hardware
+        lines = ["🖥️  Detected Hardware Profile", "-" * 100]
+        lines.append(f"OS:           {hw.os_name} {hw.os_release} ({hw.architecture}, {hw.cpu_count} CPUs)")
+        lines.append(f"System RAM:   {hw.total_ram_gb:.2f} GB Total ({hw.available_ram_gb:.2f} GB Available)")
+        if hw.has_cuda and hw.gpu_name:
+            lines.append(f"GPU:          {hw.gpu_name} ({hw.total_vram_gb:.2f} GB VRAM, {hw.free_vram_gb:.2f} GB Free)")
+        elif hw.is_apple_silicon:
+            lines.append(f"GPU:          {hw.gpu_name or 'Apple Silicon Metal'} (Unified Memory)")
+        else:
+            lines.append("Accelerator:  CPU Only (No dedicated GPU detected)")
+        lines.append("")
+        arch = self.architecture.describe() if self.architecture else f"~{self.param_count_b:.1f}B params"
+        lines.append(f"🧠 Model Fit Analysis: {self.model_name}")
+        lines.append(f"   {arch} | context {self.context_length:,} | KV cache {self.kv_cache_type}")
+        lines.append(f"   Source: {SOURCE_DESCRIPTIONS.get(self.source, self.source)}")
+        lines.append("-" * 100)
+        lines.append(
+            f"   {'QUANT':<14} {'BPW':>5} {'WEIGHTS':>9} {'KV':>7} {'TOTAL':>9}  {'FIT':<34} {'QUALITY':<18} SPEED"
+        )
+        lines.append("-" * 100)
+        for r in self.results:
+            marker = ("→" if r.quant == self.recommended_quant else " ") + ("*" if r.installed else " ")
+            icon = (
+                "✅"
+                if r.status in (QuantFitStatus.GPU_FULL, QuantFitStatus.METAL_UNIFIED)
+                else ("⚠️ " if r.fits else "❌")
+            )
+            status = r.status.value
+            if r.status == QuantFitStatus.PARTIAL and r.n_gpu_layers is not None:
+                status = f"GPU+CPU ({r.n_gpu_layers} layers on GPU)"
+            bpw = f"{r.bits_per_weight:.2f}" if r.bits_per_weight else "?"
+            approx = "" if r.size_exact else "~"
+            weights = f"{approx}{r.weights_memory_gb:.2f}"
+            lines.append(
+                f"{marker} {r.quant:<14} {bpw:>5} {weights:>9} {r.kv_cache_memory_gb:>7.2f} "
+                f"{r.required_memory_gb:>9.2f}  {icon} {status:<31} {r.quality_description:<18} {r.speed_description}"
+            )
+        lines.append("-" * 100)
+        if any(r.installed for r in self.results):
+            lines.append("  * installed   → recommended   ~ estimated size   (sizes in GB)")
+        else:
+            lines.append("  → recommended   ~ estimated size   (sizes in GB)")
+        lines.append("\n💡 Recommendation:")
+        lines.append(f"   {self.summary_message}")
+        for suggestion in self.suggestions:
+            lines.append(f"   {suggestion}")
+        for note in self.notes:
+            lines.append(f"   ℹ️  {note}")
+        return "\n".join(lines)
+
+
+def _quant_options(info: ModelInfo, param_count: int) -> list[QuantOption]:
+    """Exact options for GGUF sources; otherwise the standard ladder, anchored on an installed quant if any."""
+    if info.source in ("huggingface-gguf", "gguf-file") and info.quants:
+        return list(info.quants)
+    installed = next((q for q in info.quants if q.installed), None)
+    if installed and installed.size_bytes and installed.bpw:
+        param_count = int(installed.size_bytes * 8 / installed.bpw)  # effective params incl. embeddings
+    ladder = [QuantOption(label, int(param_count * spec["bytes_per_param"])) for label, spec in QUANT_SPECS.items()]
+    if installed:
+        ladder = [q for q in ladder if q.label != installed.label] + [installed]
+    return ladder
 
 
 def recommend_model_fit(
@@ -387,137 +514,152 @@ def recommend_model_fit(
     context_length: int = 4096,
     param_count_b: float | None = None,
     hardware: HardwareProfile | None = None,
+    *,
+    info: ModelInfo | None = None,
+    kv_cache_type: str = "f16",
 ) -> FitRecommendation:
-    """Evaluates whether a model can fit in available hardware and recommends optimal quantization."""
-    if hardware is None:
-        hardware = detect_hardware()
+    """Evaluates every quantization of a model against the hardware and recommends one.
 
-    if param_count_b is None:
-        param_count_b = parse_model_parameter_count(model_name)
-        if param_count_b is None:
-            # Default fallback assumption
-            param_count_b = 7.0
+    Pass `info` (from `omnillm.core.model_info` / `omnillm.core.fit.load_model_info`) for exact architecture and
+    file sizes; otherwise the model is estimated from its name or `param_count_b`.
+    """
+    hardware = hardware or detect_hardware()
+    if info is None or (param_count_b is not None and info.source == "estimated"):
+        info = estimated_model_info(model_name, param_count_b)
+    arch = info.architecture
+    param_count = arch.param_count or int((param_count_b or 7.0) * 1e9)
+    exact_sizes = info.source in ("huggingface-gguf", "gguf-file")
+
+    kv_gb = estimate_kv_cache_gb(arch, context_length, kv_cache_type)
+    overhead_gb = estimate_overhead_gb(arch, context_length)
 
     results: list[QuantFitResult] = []
-    recommended_quant: str | None = None
-    best_target: QuantFitStatus = QuantFitStatus.OOM
-
-    # Available pools
-    vram_pool = hardware.total_vram_gb if hardware.has_cuda else 0.0
-    metal_pool = (hardware.total_ram_gb * 0.75) if hardware.is_apple_silicon else 0.0
-    system_pool = hardware.available_ram_gb
-
-    for quant_name, spec in QUANT_SPECS.items():
-        total_gb, weights_gb, kv_gb = estimate_model_memory(param_count_b, quant_name, context_length)
-
-        if hardware.has_cuda and total_gb <= (vram_pool * 0.95):
-            status = QuantFitStatus.GPU_FULL
-            fits = True
-            speed_note = "Fast (Full GPU acceleration)"
-            notes = "Fits entirely in GPU VRAM."
-        elif hardware.is_apple_silicon and total_gb <= metal_pool:
-            status = QuantFitStatus.METAL_UNIFIED
-            fits = True
-            speed_note = "Fast (Metal Unified GPU)"
-            notes = "Fits in Apple Silicon Metal unified memory."
-        elif total_gb <= (system_pool * 0.90) or total_gb <= (hardware.total_ram_gb * 0.85):
-            status = QuantFitStatus.CPU_RAM
-            fits = True
-            speed_note = "Moderate / Slow (CPU Compute)"
-            notes = "Will run on CPU RAM (slower than GPU offload)."
-        else:
-            status = QuantFitStatus.OOM
-            fits = False
-            speed_note = "OOM"
-            notes = "Exceeds available memory."
-
+    for option in _quant_options(info, param_count):
+        size = option.size_bytes or int(param_count * (option.bpw or 4.85) / 8)
+        weights_gb = size / GIB
+        bpw = option.bpw or (size * 8 / param_count if param_count else None)
+        placement = plan_placement(weights_gb, kv_gb, overhead_gb, arch.n_layers, hardware)
         results.append(
             QuantFitResult(
-                quant=quant_name,
-                required_memory_gb=total_gb,
-                weights_memory_gb=weights_gb,
-                kv_cache_memory_gb=kv_gb,
-                status=status,
-                fits=fits,
-                quality_description=spec["quality"],
-                speed_description=speed_note,
-                notes=notes,
+                quant=option.label,
+                required_memory_gb=round(weights_gb + kv_gb + overhead_gb, 2),
+                weights_memory_gb=round(weights_gb, 2),
+                kv_cache_memory_gb=round(kv_gb, 2),
+                status=placement.status,
+                fits=placement.fits,
+                quality_description=quant_quality(option.label) if option.bpw else "Unknown",
+                speed_description=_speed(placement.status, arch, placement.n_gpu_layers),
+                notes=placement.notes,
+                overhead_memory_gb=round(overhead_gb, 2),
+                n_gpu_layers=placement.n_gpu_layers,
+                bits_per_weight=round(bpw, 2) if bpw else None,
+                files=option.files,
+                installed=option.installed,
+                warning=placement.warning,
+                size_exact=exact_sizes or (option.installed and option.size_bytes is not None),
             )
         )
+    results.sort(key=lambda r: r.weights_memory_gb, reverse=True)
 
-    # Determine recommendation
-    # Priority: Find highest quality quantization that fits on GPU/Metal, or standard Q4_K_M on CPU
-    fitting_results = [r for r in results if r.fits]
+    def bits(result: QuantFitResult) -> float:
+        return result.bits_per_weight or 0.0
+
+    fitting = [r for r in results if r.fits]
+    accelerated = [r for r in fitting if r.status in (QuantFitStatus.GPU_FULL, QuantFitStatus.METAL_UNIFIED)]
     suggestions: list[str] = []
+    notes = list(info.notes)
+    best: QuantFitResult | None = None
 
-    if fitting_results:
-        # Check if any fits on GPU / Metal
-        accelerated = [
-            r for r in fitting_results if r.status in (QuantFitStatus.GPU_FULL, QuantFitStatus.METAL_UNIFIED)
-        ]
+    good_accelerated = [r for r in accelerated if bits(r) >= _MIN_PREFERRED_GPU_BPW]
+    offloaded = [r for r in fitting if r not in accelerated]
+    if good_accelerated:
+        capped = [r for r in good_accelerated if bits(r) <= _MAX_RECOMMENDED_GPU_BPW]
+        best = (capped or good_accelerated)[0]
+    elif offloaded:
+        capped = [r for r in offloaded if bits(r) <= _MAX_RECOMMENDED_OFFLOAD_BPW]
+        best = capped[0] if capped else offloaded[-1]
         if accelerated:
-            # Prefer Q5_K_M or Q4_K_M if possible, or Q8_0 if plenty of space
-            preferred = next((r for r in accelerated if r.quant in ("Q5_K_M", "Q4_K_M", "Q8_0")), accelerated[0])
-            recommended_quant = preferred.quant
-            best_target = preferred.status
-            summary_message = (
-                f"Recommended: {recommended_quant} on {best_target.value} (~{preferred.required_memory_gb:.2f} GB). "
-                f"Fits entirely with high performance!"
+            alt = accelerated[0]
+            suggestions.append(
+                f"💡 {alt.quant} ({alt.required_memory_gb:.2f} GB) would fit entirely on the GPU: much faster, lower quality."
             )
-        else:
-            # CPU only
-            q4 = next((r for r in fitting_results if r.quant == "Q4_K_M"), fitting_results[-1])
-            recommended_quant = q4.quant
-            best_target = QuantFitStatus.CPU_RAM
-            summary_message = (
-                f"Recommended: {recommended_quant} on {best_target.value} (~{q4.required_memory_gb:.2f} GB). "
-                f"Exceeds GPU VRAM; will run using CPU RAM."
-            )
-            if hardware.has_cuda and hardware.total_vram_gb > 0:
-                suggestions.append(
-                    f"💡 Tip: For full GPU acceleration, try a smaller model (e.g., 3B or 1B) to fit within your {hardware.total_vram_gb:.1f} GB VRAM."
-                )
-    else:
-        can_fit = False
-        summary_message = f"Model {model_name} (~{param_count_b:.1f}B) is too large for your available hardware ({hardware.total_ram_gb:.1f} GB RAM)."
-        suggestions.append("💡 Tip: Consider using a smaller model (e.g. 7B, 3B, or 1B) or cloud offload.")
+    elif accelerated:
+        best = accelerated[0]
+    if best is not None and bits(best) < 3.6 and best.bits_per_weight is not None:
+        suggestions.append("⚠️  Only heavily compressed quants fit; quality will suffer. Consider a smaller model.")
 
-    can_fit = len(fitting_results) > 0
+    if best is not None:
+        target = best.status.value
+        if best.status == QuantFitStatus.PARTIAL:
+            target = f"GPU + CPU with n_gpu_layers={best.n_gpu_layers} of {arch.n_layers}"
+        summary = f"Recommended: {best.quant} → {target} (~{best.required_memory_gb:.2f} GB total)."
+        if best.warning:
+            suggestions.insert(0, f"⚠️  {best.warning}")
+        if kv_cache_type.lower() in ("f16", "bf16", "f32") and kv_gb >= 0.25 * best.required_memory_gb:
+            q8 = estimate_kv_cache_gb(arch, context_length, "q8_0")
+            suggestions.append(f"💡 --kv-cache q8_0 would cut the KV cache from {kv_gb:.2f} GB to {q8:.2f} GB.")
+        if best.status != QuantFitStatus.GPU_FULL and hardware.has_cuda and arch.is_moe:
+            notes.append(
+                "MoE model: only a fraction of the weights is used per token, so partial offload / CPU runs "
+                "much faster than a dense model of the same size. With llama.cpp, keeping the expert tensors on "
+                "CPU and the rest on GPU (--n-cpu-moe or -ot '.ffn_.*_exps.=CPU') is usually fastest."
+            )
+    else:
+        summary = (
+            f"{model_name} (~{param_count / 1e9:.1f}B) does not fit in this machine's memory "
+            f"({hardware.total_ram_gb:.1f} GB RAM"
+            + (f", {hardware.total_vram_gb:.1f} GB VRAM" if hardware.has_cuda else "")
+            + ")."
+        )
+        suggestions.append("💡 Try a smaller model, a shorter --context, or --kv-cache q4_0.")
+
+    if arch.context_length and context_length > arch.context_length:
+        notes.append(f"Context {context_length:,} exceeds the model's trained context ({arch.context_length:,}).")
 
     return FitRecommendation(
         model_name=model_name,
-        param_count_b=param_count_b,
+        param_count_b=round(param_count / 1e9, 3),
         context_length=context_length,
         hardware=hardware,
         results=results,
-        can_fit=can_fit,
-        recommended_quant=recommended_quant,
-        best_target=best_target,
-        summary_message=summary_message,
+        can_fit=bool(fitting),
+        recommended_quant=best.quant if best else None,
+        best_target=best.status if best else QuantFitStatus.OOM,
+        summary_message=summary,
         suggestions=suggestions,
+        architecture=arch,
+        source=info.source,
+        kv_cache_type=kv_cache_type,
+        repo=info.repo,
+        revision=info.revision,
+        notes=notes,
     )
 
 
 def suggest_models_for_hardware(hardware: HardwareProfile | None = None) -> list[dict[str, Any]]:
-    """Generates a list of popular local models categorized by how well they run on the detected hardware."""
-    if hardware is None:
-        hardware = detect_hardware()
+    """Rates popular local models (estimated from their sizes) against the detected hardware."""
+    hardware = hardware or detect_hardware()
 
     candidate_models = [
-        ("smollm:135m", 0.135, "Ultra-fast lightweight model for embedded & testing"),
-        ("llama-3.2:1b", 1.0, "High-efficiency edge & mobile reasoning"),
-        ("llama-3.2:3b", 3.0, "Exceptional quality-to-size ratio for laptops & consumer GPUs"),
-        ("phi-3-mini:3.8b", 3.8, "State of the art reasoning on consumer hardware"),
-        ("mistral:7b", 7.0, "Industry standard general-purpose workhorse"),
-        ("llama-3.1:8b", 8.0, "Top-tier 8B model with strong coding and instruction following"),
-        ("deepseek-r1:14b", 14.0, "Advanced mathematical and reasoning capability"),
-        ("qwen2.5:32b", 32.0, "Near-frontier performance for workstations"),
-        ("llama-3.3:70b", 70.0, "Frontier-level open model for multi-GPU servers"),
+        ("smollm:135m", 0.135, None, "Ultra-fast lightweight model for embedded & testing"),
+        ("llama3.2:1b", 1.0, None, "High-efficiency edge & mobile model"),
+        ("llama3.2:3b", 3.2, None, "Strong quality-to-size ratio for laptops"),
+        ("qwen3:4b", 4.0, None, "Small reasoning model with tool calling"),
+        ("qwen3:8b", 8.2, None, "General-purpose workhorse with thinking mode"),
+        ("gemma3:12b", 12.0, None, "Multimodal (vision) mid-size model"),
+        ("phi4:14b", 14.7, None, "Strong reasoning for its size"),
+        ("gpt-oss:20b", 20.9, 3.6, "MoE: ~3.6B active, fast even with partial offload"),
+        ("mistral-small:24b", 24.0, None, "Capable mid-large model for workstations"),
+        ("qwen3:30b-a3b", 30.5, 3.3, "MoE: ~3.3B active, fast even with partial offload"),
+        ("qwen3:32b", 32.8, None, "Near-frontier dense model for workstations"),
+        ("llama3.3:70b", 70.6, None, "Large dense model for multi-GPU / high-memory Macs"),
     ]
 
     suggestions = []
-    for name, size, desc in candidate_models:
-        fit = recommend_model_fit(name, context_length=4096, param_count_b=size, hardware=hardware)
+    for name, size, active, desc in candidate_models:
+        info = ModelInfo(name=name, architecture=estimated_architecture(size, active), source="estimated")
+        fit = recommend_model_fit(name, context_length=4096, hardware=hardware, info=info)
+        best = fit.recommended
         suggestions.append(
             {
                 "model": name,
@@ -525,13 +667,9 @@ def suggest_models_for_hardware(hardware: HardwareProfile | None = None) -> list
                 "can_fit": fit.can_fit,
                 "target": fit.best_target.value,
                 "recommended_quant": fit.recommended_quant,
-                "required_gb": next(
-                    (r.required_memory_gb for r in fit.results if r.quant == fit.recommended_quant), 0.0
-                )
-                if fit.recommended_quant
-                else 0.0,
+                "n_gpu_layers": best.n_gpu_layers if best else None,
+                "required_gb": best.required_memory_gb if best else 0.0,
                 "description": desc,
             }
         )
-
     return suggestions

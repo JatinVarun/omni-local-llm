@@ -154,6 +154,7 @@ def test_cli_handle_fit_with_model(capsys):
         context=4096,
         params=None,
         json=False,
+        offline=True,
     )
     _handle_fit(args)
     captured = capsys.readouterr()
@@ -170,6 +171,7 @@ def test_cli_handle_fit_matrix(capsys):
         context=4096,
         params=None,
         json=False,
+        offline=True,
     )
     _handle_fit(args)
     captured = capsys.readouterr()
@@ -232,3 +234,30 @@ def test_cli_reports_config_errors(tmp_path, monkeypatch, capsys):
 
     assert exit_info.value.code == 2
     assert "Config error" in capsys.readouterr().err
+
+
+def test_cli_fit_json_and_pull_errors(capsys):
+    import json as json_module
+
+    from omnillm.__main__ import _handle_fit
+
+    args = argparse.Namespace(
+        model="mistral:7b", context=8192, params=None, json=True, offline=True, kv_cache="q8_0", pull=False, quant=None
+    )
+    _handle_fit(args)
+    data = json_module.loads(capsys.readouterr().out)
+    assert data["source"] == "estimated" and data["kv_cache_type"] == "q8_0" and data["context_length"] == 8192
+
+    args.pull, args.json = True, False
+    with pytest.raises(SystemExit) as exit_info:
+        _handle_fit(args)
+    assert exit_info.value.code == 1
+    assert "--pull needs a Hugging Face GGUF repo" in capsys.readouterr().err
+
+
+def test_cli_fit_parser_options():
+    args = build_parser().parse_args(
+        ["fit", "unsloth/Qwen3-8B-GGUF", "--pull", "--quant", "Q5_K_M", "--kv-cache", "q8_0"]
+    )
+
+    assert (args.pull, args.quant, args.kv_cache, args.context, args.offline) == (True, "Q5_K_M", "q8_0", None, False)

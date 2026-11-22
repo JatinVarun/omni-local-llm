@@ -97,11 +97,13 @@ def test_recommend_model_fit_cuda_low_vram() -> None:
     assert rec3b.can_fit is True
     assert rec3b.best_target == QuantFitStatus.GPU_FULL
 
-    # 8B model cannot fit in 4GB GPU VRAM, offloads to CPU RAM
+    # 8B model doesn't fit in 4 GB VRAM: split between GPU and CPU with a concrete layer count
     rec8b = recommend_model_fit("llama-3.1-8b", hardware=hw)
     assert rec8b.can_fit is True
-    assert rec8b.best_target == QuantFitStatus.CPU_RAM
+    assert rec8b.best_target == QuantFitStatus.PARTIAL
     assert rec8b.recommended_quant == "Q4_K_M"
+    assert rec8b.recommended is not None
+    assert 1 <= (rec8b.recommended.n_gpu_layers or 0) < 32
 
 
 def test_recommend_model_fit_apple_silicon() -> None:
@@ -165,3 +167,155 @@ def test_suggest_models_for_hardware() -> None:
     # 70B should not fit on 16GB RAM
     llama70b = next(s for s in suggestions if "70b" in s["model"])
     assert llama70b["can_fit"] is False
+
+
+# ---------------------------------------------------------------- real-metadata planning
+
+from dataclasses import replace  # noqa: E402
+
+import pytest  # noqa: E402
+
+from omnillm.core.hardware import plan_placement  # noqa: E402
+from omnillm.core.model_info import ModelInfo, QuantOption, architecture_from_gguf  # noqa: E402
+
+GIB = 1024**3
+
+
+def _gpu(vram: float = 4.0, free: float = 3.6, ram: float = 16.0, available: float = 12.0) -> HardwareProfile:
+    return HardwareProfile(
+        os_name="Linux",
+        os_release="6.8",
+        architecture="x86_64",
+        cpu_count=8,
+        total_ram_gb=ram,
+        available_ram_gb=available,
+        gpu_name="GPU",
+        gpu_count=1,
+        total_vram_gb=vram,
+        free_vram_gb=free,
+        has_cuda=True,
+        is_apple_silicon=False,
+    )
+
+
+def _llama3b_info(quants: list[QuantOption], source: str = "huggingface-gguf") -> ModelInfo:
+    arch = architecture_from_gguf(
+        {
+            "general.architecture": "llama",
+            "general.parameter_count": 3_212_749_888,
+            "llama.block_count": 28,
+            "llama.embedding_length": 3072,
+            "llama.attention.head_count": 24,
+            "llama.attention.head_count_kv": 8,
+            "llama.context_length": 131072,
+        }
+    )
+    assert arch is not None
+    return ModelInfo(
+        name="org/Llama-3.2-3B-GGUF", architecture=arch, source=source, quants=quants, repo="org/Llama-3.2-3B-GGUF"
+    )
+
+
+def test_parse_moe_name_is_not_mistaken_for_dense_size():
+    assert parse_model_parameter_count("mixtral-8x7b") == pytest.approx(8 * 7 * 0.83)
+    assert parse_model_parameter_count("qwen3-30b-a3b") == 30.0
+
+
+def test_plan_placement_tiers():
+    hw = _gpu()
+    assert plan_placement(2.0, 0.5, 0.5, 28, hw).status == QuantFitStatus.GPU_FULL
+
+    partial = plan_placement(6.0, 1.0, 0.5, 32, hw)
+    assert partial.status == QuantFitStatus.PARTIAL
+    per_layer = 7.0 / 32
+    assert partial.n_gpu_layers == int((3.6 * 0.95 - 0.5) // per_layer)
+    assert not partial.warning
+
+    tight = plan_placement(12.0, 1.0, 0.5, 32, _gpu(available=5.0))
+    assert tight.status == QuantFitStatus.PARTIAL and "close other apps" in tight.warning
+
+    cpu_only = HardwareProfile("Linux", "6.8", "x86_64", 8, 32.0, 30.0)
+    assert plan_placement(10.0, 1.0, 0.5, 32, cpu_only).status == QuantFitStatus.CPU_RAM
+    assert plan_placement(40.0, 1.0, 0.5, 32, cpu_only).status == QuantFitStatus.OOM
+
+    mac = HardwareProfile("Darwin", "23", "arm64", 12, 32.0, 20.0, is_apple_silicon=True)
+    assert plan_placement(20.0, 1.0, 0.5, 32, mac).status == QuantFitStatus.METAL_UNIFIED
+
+
+def test_exact_quants_recommend_best_full_gpu_option_capped_at_q8():
+    quants = [
+        QuantOption("F16", int(6.0 * GIB), ("m-F16.gguf",)),
+        QuantOption("Q8_0", int(3.2 * GIB), ("m-Q8_0.gguf",)),
+        QuantOption("Q4_K_M", int(1.9 * GIB), ("m-Q4_K_M.gguf",)),
+    ]
+    big_gpu = _gpu(vram=24.0, free=23.0, ram=64, available=60)
+
+    rec = recommend_model_fit("org/Llama-3.2-3B-GGUF", 8192, hardware=big_gpu, info=_llama3b_info(quants))
+
+    assert rec.recommended_quant == "Q8_0"  # F16 fits too, but Q8_0 is the cap
+    assert rec.source == "huggingface-gguf"
+    assert all(r.size_exact for r in rec.results)
+    assert rec.recommended is not None and rec.recommended.files == ("m-Q8_0.gguf",)
+    assert rec.recommended.kv_cache_memory_gb == pytest.approx(0.88, abs=0.01)
+    assert rec.to_dict()["recommended"]["files"] == ["m-Q8_0.gguf"]
+
+
+def test_decent_quant_fully_on_gpu_beats_better_quant_split_across_gpu_and_cpu():
+    quants = [QuantOption("Q4_K_M", int(4.6 * GIB), ("q4.gguf",)), QuantOption("IQ3_M", int(2.2 * GIB), ("iq3.gguf",))]
+
+    rec = recommend_model_fit("m", 4096, hardware=_gpu(), info=_llama3b_info(quants))
+
+    assert rec.recommended_quant == "IQ3_M"
+    assert rec.best_target == QuantFitStatus.GPU_FULL
+
+
+def test_partial_offload_prefers_q4_over_heavily_compressed_gpu_only_quant():
+    quants = [
+        QuantOption("Q8_0", int(8.0 * GIB), ("q8.gguf",)),
+        QuantOption("Q4_K_M", int(4.6 * GIB), ("q4.gguf",)),
+        QuantOption("Q2_K", int(1.5 * GIB), ("q2.gguf",)),
+    ]
+    rec = recommend_model_fit("m", 4096, hardware=_gpu(), info=_llama3b_info(quants))
+
+    assert rec.recommended_quant == "Q4_K_M"
+    assert rec.best_target == QuantFitStatus.PARTIAL
+    assert "n_gpu_layers=" in rec.summary_message
+    assert any("Q2_K" in s and "entirely on the GPU" in s for s in rec.suggestions)
+
+
+def test_kv_cache_hint_trained_context_note_and_kv_type():
+    quants = [QuantOption("Q4_K_M", int(1.9 * GIB), ("q4.gguf",))]
+    info = _llama3b_info(quants)
+    info.architecture = replace(info.architecture, context_length=8192)
+
+    rec = recommend_model_fit("m", 32768, hardware=_gpu(vram=24, free=23), info=info)
+    q8 = recommend_model_fit("m", 32768, hardware=_gpu(vram=24, free=23), info=info, kv_cache_type="q8_0")
+
+    assert any("--kv-cache q8_0" in s for s in rec.suggestions)
+    assert any("exceeds the model's trained context" in n for n in rec.notes)
+    assert q8.results[0].kv_cache_memory_gb < rec.results[0].kv_cache_memory_gb / 1.8
+    with pytest.raises(ValueError, match="Unknown KV cache type"):
+        recommend_model_fit("m", 4096, hardware=_gpu(), info=info, kv_cache_type="q3")
+
+
+def test_installed_ollama_quant_anchors_the_estimated_ladder():
+    installed = QuantOption("Q4_K_M", 2_019_393_189, installed=True)
+    rec = recommend_model_fit("llama3.2:3b", 4096, hardware=_gpu(), info=_llama3b_info([installed], source="ollama"))
+
+    labels = [r.quant for r in rec.results]
+    assert labels.count("Q4_K_M") == 1 and "Q8_0" in labels and "FP16" in labels
+    row = next(r for r in rec.results if r.quant == "Q4_K_M")
+    assert row.installed and row.size_exact and row.weights_memory_gb == pytest.approx(1.88, abs=0.01)
+    assert not next(r for r in rec.results if r.quant == "Q8_0").size_exact
+    assert "*" in rec.format_table()
+
+
+def test_moe_note_when_offloading():
+    info = _llama3b_info([QuantOption("Q4_K_M", int(16 * GIB), ("q4.gguf",))])
+    info.architecture = replace(info.architecture, expert_count=128, expert_used_count=8, active_param_count=int(3.3e9))
+
+    rec = recommend_model_fit("moe", 4096, hardware=_gpu(ram=32, available=28), info=info)
+
+    assert rec.best_target == QuantFitStatus.PARTIAL
+    assert any("MoE model" in n and "--n-cpu-moe" in n for n in rec.notes)
+    assert rec.results[0].speed_description == "Good (MoE)"
