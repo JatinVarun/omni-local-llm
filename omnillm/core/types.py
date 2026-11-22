@@ -1,4 +1,4 @@
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeVar
 
@@ -173,6 +173,21 @@ class BackendCapabilities:
     embeddings: bool = True
     structured_outputs: bool = True
     vision: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ModelTarget:
+    """A concrete backend + model, plus default request options and fallbacks (set when it comes from an alias)."""
+
+    backend: str
+    model: str
+    options: Mapping[str, Any] = field(default_factory=dict)
+    fallbacks: tuple[str, ...] = ()
+    alias: str | None = None
+
+    @property
+    def ref(self) -> str:
+        return f"{self.backend}/{self.model}"
 
 
 type ChatResult = ChatResponse | Iterator[ChatChunk]

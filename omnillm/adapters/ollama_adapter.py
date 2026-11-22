@@ -1,9 +1,12 @@
 import asyncio
+import os
+import weakref
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 from omnillm.core.base import LLMBackend
-from omnillm.core.errors import BackendUnavailableError
+from omnillm.core.errors import BackendUnavailableError, InvalidRequestError, OmniLLMError
 from omnillm.core.media import normalize_messages_for_ollama
 from omnillm.core.tool_calls import to_openai_tool_call
 from omnillm.core.types import (
@@ -29,6 +32,14 @@ else:
     ollama = ollama_module
     AsyncClient = OllamaAsyncClient
 
+httpx: Any = None
+try:
+    import httpx as httpx_module
+except ImportError:  # Installed with the ollama client.
+    pass
+else:
+    httpx = httpx_module
+
 
 def _value(value: Any, key: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
@@ -37,16 +48,60 @@ def _value(value: Any, key: str, default: Any = None) -> Any:
 
 
 class OllamaAdapter(LLMBackend):
-    """Adapter for the official Ollama Python client."""
+    """Adapter for the official Ollama Python client.
+
+    `host` (default: ``$OLLAMA_HOST`` or localhost) and `timeout` let one manager talk to several Ollama
+    servers. Connection failures raise `BackendUnavailableError`, so alias fallbacks can take over.
+    """
 
     def __init__(
         self,
         client: Any | None = None,
         async_client_factory: Callable[[], Any] | None = None,
+        *,
+        host: str | None = None,
+        timeout: float | None = None,
     ):
+        self.host = host or os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434"
+        if client is None and ollama is not None and (host is not None or timeout is not None):
+            client = ollama.Client(host=host, timeout=timeout)
         self._client = client if client is not None else ollama
+        if async_client_factory is None and AsyncClient is not None:
+
+            def async_client_factory() -> Any:
+                return AsyncClient(host=host, timeout=timeout)
+
         self._async_client_factory = async_client_factory
+        self._async_clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any] = weakref.WeakKeyDictionary()
         self._known_models: set[str] = set()
+
+    def _response_error_type(self) -> Any:
+        response_error = getattr(self._client, "ResponseError", None)
+        if response_error is None and ollama is not None:
+            response_error = getattr(ollama, "ResponseError", None)
+        return response_error
+
+    def _translate(self, error: Exception) -> Exception:
+        if isinstance(error, OmniLLMError):
+            return error
+        response_error = self._response_error_type()
+        if response_error is not None and isinstance(error, response_error):
+            status = _value(error, "status_code") or -1
+            message = f"Ollama error: {_value(error, 'error') or error}"
+            return InvalidRequestError(message) if 400 <= status < 500 else BackendUnavailableError(message)
+        if isinstance(error, ConnectionError) or (httpx is not None and isinstance(error, httpx.TransportError)):
+            return BackendUnavailableError(f"Cannot reach the Ollama server at {self.host}. Is `ollama serve` running?")
+        return error
+
+    @contextmanager
+    def _errors(self) -> Iterator[None]:
+        try:
+            yield
+        except Exception as error:
+            translated = self._translate(error)
+            if translated is error:
+                raise
+            raise translated from error
 
     def _require_client(self) -> Any:
         if self._client is None:
@@ -56,13 +111,15 @@ class OllamaAdapter(LLMBackend):
         return self._client
 
     def _make_async_client(self) -> Any:
-        if self._async_client_factory is not None:
-            return self._async_client_factory()
-        if AsyncClient is None:
+        if self._async_client_factory is None:
             raise BackendUnavailableError(
                 "The Ollama backend requires the optional dependency. Install omni-local-llm[ollama]."
             )
-        return AsyncClient()
+        loop = asyncio.get_running_loop()
+        client = self._async_clients.get(loop)
+        if client is None:
+            client = self._async_clients[loop] = self._async_client_factory()
+        return client
 
     def pull_model(self, model_name: str, source: ModelSource) -> None:
         del source
@@ -73,9 +130,7 @@ class OllamaAdapter(LLMBackend):
         try:
             client.show(model_name)
         except Exception as error:
-            response_error = getattr(client, "ResponseError", None)
-            if response_error is None and ollama is not None:
-                response_error = getattr(ollama, "ResponseError", None)
+            response_error = self._response_error_type()
             if response_error is None or not isinstance(error, response_error) or _value(error, "status_code") != 404:
                 raise
             client.pull(model_name)
@@ -150,29 +205,40 @@ class OllamaAdapter(LLMBackend):
             usage=cls._usage(response) if done else None,
         )
 
+    def _stream(self, first: Any, iterator: Iterator[Any]) -> Iterator[ChatChunk]:
+        if first is not None:
+            yield self._chunk(first)
+        with self._errors():
+            for raw in iterator:
+                yield self._chunk(raw)
+
+    async def _astream(self, first: Any, iterator: AsyncIterator[Any]) -> AsyncIterator[ChatChunk]:
+        if first is not None:
+            yield self._chunk(first)
+        with self._errors():
+            async for raw in iterator:
+                yield self._chunk(raw)
+
     def chat(self, request: ChatRequest) -> ChatResponse | Iterator[ChatChunk]:
-        self.pull_model(request.model, request.model_source)
-        response = self._require_client().chat(**self._chat_kwargs(request))
-        if not request.stream:
-            return self._response(response)
-
-        def stream() -> Iterator[ChatChunk]:
-            for chunk in response:
-                yield self._chunk(chunk)
-
-        return stream()
+        with self._errors():
+            self.pull_model(request.model, request.model_source)
+            response = self._require_client().chat(**self._chat_kwargs(request))
+            if not request.stream:
+                return self._response(response)
+            # Fetch the first chunk now so connection/model errors surface here (enabling fallbacks).
+            iterator = iter(response)
+            first = next(iterator, None)
+        return self._stream(first, iterator)
 
     async def achat(self, request: ChatRequest) -> ChatResponse | AsyncIterator[ChatChunk]:
-        await asyncio.to_thread(self.pull_model, request.model, request.model_source)
-        response = await self._make_async_client().chat(**self._chat_kwargs(request))
-        if not request.stream:
-            return self._response(response)
-
-        async def stream() -> AsyncIterator[ChatChunk]:
-            async for chunk in response:
-                yield self._chunk(chunk)
-
-        return stream()
+        with self._errors():
+            await asyncio.to_thread(self.pull_model, request.model, request.model_source)
+            response = await self._make_async_client().chat(**self._chat_kwargs(request))
+            if not request.stream:
+                return self._response(response)
+            iterator = aiter(response)
+            first = await anext(iterator, None)
+        return self._astream(first, iterator)
 
     @classmethod
     def _embedding_response(cls, request: EmbeddingRequest, raw_response: Any) -> EmbeddingResponse:
@@ -183,6 +249,10 @@ class OllamaAdapter(LLMBackend):
         return EmbeddingResponse(data=data, model=request.model, usage=usage)
 
     def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
+        with self._errors():
+            return self._embed(request)
+
+    def _embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         self.pull_model(request.model, request.model_source)
         client = self._require_client()
         if hasattr(client, "embed"):
@@ -195,6 +265,10 @@ class OllamaAdapter(LLMBackend):
         return self._embedding_response(request, {"embeddings": embeddings})
 
     async def aembed(self, request: EmbeddingRequest) -> EmbeddingResponse:
+        with self._errors():
+            return await self._aembed(request)
+
+    async def _aembed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         await asyncio.to_thread(self.pull_model, request.model, request.model_source)
         client = self._make_async_client()
         if hasattr(client, "embed"):
@@ -207,7 +281,8 @@ class OllamaAdapter(LLMBackend):
         return self._embedding_response(request, {"embeddings": embeddings})
 
     def list_models(self) -> list[str]:
-        response = self._require_client().list()
+        with self._errors():
+            response = self._require_client().list()
         models = _value(response, "models", []) or []
         return [
             _value(model, "model", _value(model, "name"))

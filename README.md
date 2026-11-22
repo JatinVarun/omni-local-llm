@@ -35,7 +35,8 @@
 
 | Feature | Description |
 |---|---|
-| **Multi-Backend** | Swap between [Ollama](https://ollama.com/) and [llama.cpp](https://github.com/ggerganov/llama.cpp) with a single parameter change |
+| **Multi-Backend** | [Ollama](https://ollama.com/), in-process [llama.cpp](https://github.com/ggerganov/llama.cpp), and **any OpenAI-compatible server** (vLLM, llama-server, LM Studio, SGLang, KoboldCpp, MLX-LM, LocalAI, …) behind one API |
+| **Model Aliases & Fallbacks** | Name models once in `omnillm.toml` (`model="coder"`), preset their options, and fall back automatically when a server is down |
 | **Vision & Multimodal** | Native image understanding across Ollama and llama.cpp (file paths, bytes, data URIs, and OpenAI format) |
 | **Evaluation & Benchmarking** | Measure TTFT, tokens/sec, schema compliance, tool-calling precision, and needle-in-haystack context retrieval |
 | **Unified CLI** | Dedicated binary `omnillm` with `chat`, `run`, `models`, `bench`, `eval`, `fit`, and `serve` commands |
@@ -99,11 +100,12 @@ response = manager.chat(
 │              (History · Streaming · Tools)              │
 ├─────────────────────────────────────────────────────────┤
 │                  LocalLLMManager                        │
-│              (Backend Registry & Router)                │
-├────────────────────────┬────────────────────────────────┤
-│    OllamaAdapter       │       LlamaCPPAdapter          │
-│  (ollama Python SDK)   │  (llama-cpp-python + HF Hub)  │
-└────────────────────────┴────────────────────────────────┘
+│     (Backend Registry · Aliases · Router · Fallbacks)   │
+├──────────────────┬──────────────────┬───────────────────┤
+│  OllamaAdapter   │ LlamaCPPAdapter  │ OpenAICompatible- │
+│ (ollama client,  │ (llama-cpp-python│ Adapter (httpx:   │
+│  any host)       │  + HF Hub)       │ vLLM, LM Studio…) │
+└──────────────────┴──────────────────┴───────────────────┘
 ```
 
 ### Module Map
@@ -111,13 +113,89 @@ response = manager.chat(
 | Module | Purpose |
 |---|---|
 | [`omnillm/core/base.py`](omnillm/core/base.py) | `LLMBackend` — abstract base class for all adapters |
-| [`omnillm/core/manager.py`](omnillm/core/manager.py) | `LocalLLMManager` — backend registry & request router |
+| [`omnillm/core/manager.py`](omnillm/core/manager.py) | `LocalLLMManager` — backend registry, model aliases, request routing & fallbacks |
+| [`omnillm/core/config.py`](omnillm/core/config.py) | `omnillm.toml` loading and validation (backends, aliases) |
 | [`omnillm/core/session.py`](omnillm/core/session.py) | `ChatSession` — conversation state, streaming, tool calls |
 | [`omnillm/adapters/ollama_adapter.py`](omnillm/adapters/ollama_adapter.py) | Ollama integration via official Python client |
 | [`omnillm/adapters/llamacpp_adapter.py`](omnillm/adapters/llamacpp_adapter.py) | llama.cpp integration + automatic GGUF model caching |
+| [`omnillm/adapters/openai_adapter.py`](omnillm/adapters/openai_adapter.py) | Any OpenAI-compatible HTTP server (vLLM, llama-server, LM Studio, …) |
 | [`omnillm/core/hardware.py`](omnillm/core/hardware.py) | Hardware auto-detection, memory estimation, and quantization recommender |
 | [`omnillm/server.py`](omnillm/server.py) | OpenAI-compatible FastAPI HTTP server |
 | [`omnillm/__main__.py`](omnillm/__main__.py) | Interactive CLI chat, benchmark, and evaluation interface |
+
+---
+
+## Backends, Configuration & Model Aliases
+
+### Any OpenAI-compatible server
+
+Most local inference servers speak the OpenAI API. Point Omni-Local-LLM at one and use it like any other backend:
+
+| Server | Default `base_url` |
+|---|---|
+| [LM Studio](https://lmstudio.ai/) | `http://localhost:1234/v1` |
+| [llama.cpp `llama-server`](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) | `http://localhost:8080/v1` |
+| [vLLM](https://docs.vllm.ai/) | `http://localhost:8000/v1` |
+| [SGLang](https://docs.sglang.ai/) | `http://localhost:30000/v1` |
+| [KoboldCpp](https://github.com/LostRuins/koboldcpp) | `http://localhost:5001/v1` |
+| [Ollama](https://ollama.com/) (OpenAI endpoint) | `http://localhost:11434/v1` |
+
+`omnillm serve` also defaults to port 8000, so pass `--port` if you run it next to vLLM.
+
+```bash
+# No config needed for a quick try
+omnillm chat --base-url http://localhost:1234/v1 --model qwen3-8b
+```
+
+```python
+from omnillm import LocalLLMManager, OpenAICompatibleAdapter
+
+manager = LocalLLMManager()
+manager.register_backend("lmstudio", lambda: OpenAICompatibleAdapter("http://localhost:1234/v1", name="lmstudio"))
+response = manager.chat(model="lmstudio/qwen3-8b", messages=[{"role": "user", "content": "Hi!"}])
+```
+
+Streaming (with token usage), tool calling, structured outputs, vision, and embeddings all work through it. Unreachable servers, timeouts, auth failures and 5xx responses raise `BackendUnavailableError`; bad requests (unknown model, context too long) raise `InvalidRequestError` with the server's message.
+
+### `omnillm.toml`: named backends and model aliases
+
+Describe your servers and favourite models once. The CLI and `omnillm serve` load the first file found among `--config`, `$OMNILLM_CONFIG`, `./omnillm.toml`, and `~/.config/omnillm/config.toml`; in Python use `LocalLLMManager.from_config()`.
+
+```toml
+default_backend = "ollama"          # where bare model names go
+
+[backends.lmstudio]
+type = "openai"                     # any OpenAI-compatible server
+base_url = "http://localhost:1234/v1"
+# api_key_env = "LMSTUDIO_API_KEY"  # or api_key = "..."; also: headers, timeout, capabilities
+
+[backends.gpu-box]
+type = "ollama"                     # a second Ollama server
+host = "http://gpu-box:11434"
+
+[models.coder]
+backend = "llama.cpp"
+model = "unsloth/Qwen2.5-Coder-7B-Instruct-GGUF"
+filename = "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
+n_ctx = 8192
+temperature = 0.2
+fallbacks = ["gpu-box/qwen2.5-coder:7b", "fast"]   # tried in order if a backend is unavailable
+
+[models.fast]
+model = "lmstudio/qwen3-4b"         # 'backend/model' works too
+```
+
+```python
+manager = LocalLLMManager.from_config()
+manager.chat(model="coder", messages=[...])                  # alias: backend, GGUF file, n_ctx, temperature preset
+manager.chat(model="coder", messages=[...], temperature=1)   # explicit arguments override alias presets
+manager.chat(model="gpu-box/llama3.2:3b", messages=[...])    # 'backend/model' reference
+session = manager.create_session(model="coder")              # aliases resolve on every turn, so fallbacks apply
+```
+
+Model references resolve as: **alias** → **`backend/model`** (if the prefix is a known backend) → **bare name on `default_backend`**. So namespaced Ollama models such as `huihui_ai/qwen3` keep working. The config is validated strictly on load, so a typo like `temprature` fails with the file, table, and allowed keys instead of being silently ignored.
+
+Fallbacks trigger only when a backend is unavailable or lacks a needed capability (e.g. vision), never on a bad request. If every target fails, the primary's error is raised with a note per attempted target. Aliases work everywhere: SDK, sessions, CLI (`--model coder`, `bench --targets coder,fast`), and the API server (`"model": "coder"`; aliases are listed in `/v1/models`).
 
 ---
 
@@ -130,6 +208,7 @@ response = manager.chat(
 - At least one backend:
   - [Ollama](https://ollama.com/) installed and running, **or**
   - A GGUF model on [Hugging Face Hub](https://huggingface.co/) (auto-downloaded)
+  - **or** any OpenAI-compatible server (LM Studio, vLLM, llama-server, …)
 
 ### Install from source
 
@@ -146,6 +225,8 @@ pip install "omni-local-llm[ollama,server]"
 # or
 uv pip install "omni-local-llm[ollama,server]"
 ```
+
+Extras: `ollama`, `llama-cpp`, `openai` (OpenAI-compatible servers; just `httpx`), `server`, or `all`.
 
 ---
 
@@ -406,11 +487,17 @@ omnillm chat --model llama3 --max-turns 10 --max-tokens 2048
 omnillm run --model llama3 "Explain quantum computing in one sentence."
 cat document.txt | omnillm run --model llama3 "Summarize the key points:"
 
-# 3. List installed / detected local models
+# 3. List aliases and the models every backend reports
 omnillm models
+
+# Use an alias from omnillm.toml, or any OpenAI-compatible server without a config
+omnillm run --model coder "Write a Python function that reverses a string."
+omnillm chat --base-url http://localhost:8080/v1 --model any
+omnillm --config ./team.toml chat --model fast
 
 # 4. Run performance benchmark (TTFT and throughput)
 omnillm bench --backend ollama --model llama3 --runs 3
+omnillm bench --targets coder,fast,ollama/llama3.2:3b   # compare aliases and refs side by side
 
 # 5. Run model evaluations or Needle-In-A-Haystack retrieval test
 omnillm eval --backend ollama --model llama3
@@ -592,7 +679,7 @@ result.print_table()
 
 ### API Server
 
-Launch an OpenAI-compatible local API server:
+Launch an OpenAI-compatible local API server. It loads `omnillm.toml` like the CLI, so clients can request any alias (`"model": "coder"`), any `backend/model` reference, or a bare model name for the default backend. One endpoint fronts all your local servers, with fallbacks:
 
 ```bash
 omnillm serve
@@ -738,11 +825,11 @@ This project is licensed under the **MIT License** — see the [LICENSE](LICENSE
 
 ## Roadmap
 
-- [ ] vLLM backend adapter
-- [ ] KoboldCpp backend adapter
-- [ ] Token usage tracking and reporting
+- [x] vLLM, KoboldCpp, LM Studio, llama-server, SGLang… (via the OpenAI-compatible adapter)
+- [x] Model aliases with fallbacks (`omnillm.toml`)
+- [x] Token usage reporting (including streams)
 - [x] Vision/multimodal support
-- [ ] Model hot-swapping in sessions
+- [ ] Hardware-aware `fit` using real GGUF metadata, with `--pull`
 - [ ] Prompt template management
 - [ ] Docker image for the API server
 

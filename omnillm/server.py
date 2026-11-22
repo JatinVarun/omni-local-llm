@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
@@ -76,16 +77,6 @@ class EmbeddingInputRequest(BaseModel):
     user: str | None = None
 
 
-def parse_model_string(model_string: str) -> tuple[str, str]:
-    """Parses 'backend/model_name' into a registered backend and model name."""
-    if "/" not in model_string:
-        return "ollama", model_string
-    backend, model = model_string.split("/", 1)
-    if not backend or not model:
-        raise InvalidRequestError("Model must be 'backend/model' or a non-empty Ollama model name.")
-    return backend, model
-
-
 def _error_response(error: Exception) -> JSONResponse:
     status_code = 500
     error_type = "server_error"
@@ -111,22 +102,24 @@ def _sse(data: dict[str, Any]) -> str:
 
 def create_app(manager: LocalLLMManager | None = None) -> FastAPI:
     app = FastAPI(title="Omni-Local-LLM OpenAI API", version="0.3.0")
-    llm_manager = manager or LocalLLMManager()
+    llm_manager = manager if manager is not None else LocalLLMManager.from_config()
 
     @app.get("/v1/models", response_model=None)
     async def list_models() -> JSONResponse | dict[str, Any]:
         try:
-            models = [
-                {
-                    "id": f"{backend}/{model}",
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": backend,
-                }
-                for backend, model in llm_manager.list_models()
-            ]
+            # Backends may be remote HTTP servers: query them off the event loop.
+            backend_models = await asyncio.to_thread(llm_manager.list_models)
+            aliases = llm_manager.aliases
         except Exception as error:
             return _error_response(error)
+        models = [
+            {"id": name, "object": "model", "created": 0, "owned_by": f"alias:{target.ref}"}
+            for name, target in aliases.items()
+        ]
+        models.extend(
+            {"id": f"{backend}/{model}", "object": "model", "created": 0, "owned_by": backend}
+            for backend, model in backend_models
+        )
         return {"object": "list", "data": models}
 
     @app.post("/v1/chat/completions", response_model=None)
@@ -135,7 +128,6 @@ def create_app(manager: LocalLLMManager | None = None) -> FastAPI:
             return _error_response(InvalidRequestError("Only n=1 is supported."))
 
         try:
-            backend, model_name = parse_model_string(request.model)
             messages = sanitize_untrusted_messages(
                 [message.model_dump(exclude_none=True) for message in request.messages]
             )
@@ -147,8 +139,7 @@ def create_app(manager: LocalLLMManager | None = None) -> FastAPI:
                 response_format_dict = request.response_format.model_dump(by_alias=True, exclude_none=True)
 
             response = await llm_manager.achat(
-                backend=backend,
-                model=model_name,
+                model=request.model,
                 messages=messages,
                 stream=request.stream,
                 json_mode=json_mode,
@@ -285,10 +276,8 @@ def create_app(manager: LocalLLMManager | None = None) -> FastAPI:
             return _error_response(InvalidRequestError("Embedding input must contain non-empty strings."))
 
         try:
-            backend, model_name = parse_model_string(request.model)
             response = await llm_manager.aembed(
-                backend=backend,
-                model=model_name,
+                model=request.model,
                 input=inputs,
             )
         except Exception as error:
@@ -317,10 +306,21 @@ def create_app(manager: LocalLLMManager | None = None) -> FastAPI:
     return app
 
 
-app = create_app()
+_default_app: FastAPI | None = None
+
+
+def __getattr__(name: str) -> Any:
+    """Builds the module-level ``app`` (for ``uvicorn omnillm.server:app``) on first access, so importing this
+    module never reads config files."""
+    global _default_app
+    if name == "app":
+        if _default_app is None:
+            _default_app = create_app()
+        return _default_app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(create_app(), host="127.0.0.1", port=8000)

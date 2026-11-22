@@ -191,6 +191,15 @@ class BenchmarkHarness:
     def __init__(self, manager: LocalLLMManager | None = None):
         self.manager = manager or LocalLLMManager()
 
+    def _target(
+        self, spec: "tuple[str, str] | tuple[str, str, dict[str, Any]] | BenchmarkTarget | str"
+    ) -> BenchmarkTarget:
+        """String specs are resolved by the manager, so aliases (and their preset options) work as targets."""
+        if isinstance(spec, str):
+            resolved = self.manager.resolve(spec)
+            return BenchmarkTarget(backend=resolved.backend, model=resolved.model, options=dict(resolved.options))
+        return BenchmarkTarget.from_spec(spec)
+
     def run(
         self,
         targets: Sequence[tuple[str, str] | tuple[str, str, dict[str, Any]] | BenchmarkTarget | str],
@@ -202,7 +211,7 @@ class BenchmarkHarness:
     ) -> BenchmarkSuite:
         """Runs the performance benchmark synchronously across all targets."""
         suite = BenchmarkSuite()
-        normalized_targets = [BenchmarkTarget.from_spec(t) for t in targets]
+        normalized_targets = [self._target(t) for t in targets]
 
         for target in normalized_targets:
             res = BenchmarkResult(target=target)
@@ -248,7 +257,7 @@ class BenchmarkHarness:
     ) -> BenchmarkSuite:
         """Runs the performance benchmark asynchronously across all targets."""
         suite = BenchmarkSuite()
-        normalized_targets = [BenchmarkTarget.from_spec(t) for t in targets]
+        normalized_targets = [self._target(t) for t in targets]
 
         for target in normalized_targets:
             res = BenchmarkResult(target=target)
