@@ -82,7 +82,7 @@ class NeedleHarness:
 
     def run(
         self,
-        backend: str,
+        backend: str | None,
         model: str,
         *,
         secret_code: str = "BLUE-TITAN-42",
@@ -91,7 +91,7 @@ class NeedleHarness:
         **options: Any,
     ) -> NeedleResult:
         """Executes needle retrieval across the specified context depths."""
-        result = NeedleResult(backend=backend, model=model)
+        result = NeedleResult(backend=backend or self.manager.resolve(model).backend, model=model)
         needle_sentence = f" IMPORTANT NOTE: The secret access code is {secret_code}. Remember this code exactly. "
 
         # Build haystack up to target_word_count

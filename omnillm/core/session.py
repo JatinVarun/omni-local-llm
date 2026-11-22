@@ -18,7 +18,7 @@ class ChatSession:
     def __init__(
         self,
         manager: "LocalLLMManager",
-        backend: str,
+        backend: str | None,
         model: str,
         system_prompt: str | None = None,
         *,

@@ -1,3 +1,5 @@
+from .adapters.openai_adapter import OpenAICompatibleAdapter
+from .core.config import ConfigError
 from .core.errors import (
     BackendNotFoundError,
     BackendUnavailableError,
@@ -26,6 +28,7 @@ from .core.types import (
     EmbeddingData,
     EmbeddingRequest,
     EmbeddingResponse,
+    ModelTarget,
     Usage,
 )
 from .harness import BenchmarkHarness, EvalHarness, NeedleHarness
@@ -39,6 +42,7 @@ __all__ = [
     "ChatRequest",
     "ChatResponse",
     "ChatSession",
+    "ConfigError",
     "EmbeddingData",
     "EmbeddingRequest",
     "EmbeddingResponse",
@@ -47,8 +51,10 @@ __all__ = [
     "HardwareProfile",
     "InvalidRequestError",
     "LocalLLMManager",
+    "ModelTarget",
     "NeedleHarness",
     "OmniLLMError",
+    "OpenAICompatibleAdapter",
     "QuantFitResult",
     "QuantFitStatus",
     "ToolLoopLimitError",

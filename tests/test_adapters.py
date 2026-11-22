@@ -9,7 +9,7 @@ import pytest
 
 from omnillm.adapters.llamacpp_adapter import LlamaCPPAdapter
 from omnillm.adapters.ollama_adapter import OllamaAdapter
-from omnillm.core.errors import InvalidRequestError
+from omnillm.core.errors import BackendUnavailableError, InvalidRequestError
 from omnillm.core.types import ChatRequest, EmbeddingRequest, ModelSource
 
 
@@ -492,3 +492,65 @@ async def test_llamacpp_async_streams_are_serialized():
 
     assert results == [["a", "b", "c"]] * 4
     assert models[0].max_active == 1
+
+
+def test_ollama_connection_errors_become_backend_unavailable():
+    client = FakeOllamaClient()
+    client.show = lambda model: (_ for _ in ()).throw(ConnectionError("refused"))  # type: ignore[method-assign]
+    adapter = OllamaAdapter(client=client, host="http://gpu-box:11434")
+
+    with pytest.raises(BackendUnavailableError, match="gpu-box:11434"):
+        adapter.chat(ChatRequest(model="m", messages=[]))
+    with pytest.raises(BackendUnavailableError):
+        adapter.embed(EmbeddingRequest(model="m", input=["x"]))
+
+
+def test_ollama_response_errors_are_classified():
+    client = FakeOllamaClient()
+    adapter = OllamaAdapter(client=client)
+
+    def chat(**kwargs: Any) -> Any:
+        raise FakeOllamaClient.ResponseError(400) if kwargs["model"] == "bad" else FakeOllamaClient.ResponseError(500)
+
+    client.chat = chat  # type: ignore[method-assign]
+
+    with pytest.raises(InvalidRequestError, match="Ollama error"):
+        adapter.chat(ChatRequest(model="bad", messages=[]))
+    with pytest.raises(BackendUnavailableError, match="Ollama error"):
+        adapter.chat(ChatRequest(model="oom", messages=[]))
+
+
+def test_ollama_stream_errors_surface_at_call_time():
+    client = FakeOllamaClient()
+
+    def failing_stream(**kwargs: Any) -> Iterator[dict[str, Any]]:
+        raise ConnectionError("refused")
+        yield {}  # pragma: no cover
+
+    client.chat = failing_stream  # type: ignore[method-assign]
+    adapter = OllamaAdapter(client=client)
+
+    with pytest.raises(BackendUnavailableError):
+        adapter.chat(ChatRequest(model="m", messages=[], stream=True))
+
+
+async def test_ollama_async_stream_errors_surface_at_call_time():
+    class FailingAsyncClient:
+        async def chat(self, **kwargs: Any) -> AsyncIterator[dict[str, Any]]:
+            async def stream() -> AsyncIterator[dict[str, Any]]:
+                raise ConnectionError("refused")
+                yield {}  # pragma: no cover
+
+            return stream()
+
+    adapter = OllamaAdapter(client=FakeOllamaClient(), async_client_factory=FailingAsyncClient)
+
+    with pytest.raises(BackendUnavailableError):
+        await adapter.achat(ChatRequest(model="m", messages=[], stream=True))
+
+
+def test_ollama_host_configures_real_clients():
+    adapter = OllamaAdapter(host="http://gpu-box:11434", timeout=30)
+
+    assert adapter.host == "http://gpu-box:11434"
+    assert str(adapter._client._client.base_url).startswith("http://gpu-box:11434")

@@ -14,6 +14,8 @@ keywords = [
     "ollama",
     "llama-cpp",
     "openai",
+    "vllm",
+    "lm-studio",
     "ai",
     "machine-learning",
     "inference",
@@ -37,6 +39,7 @@ dependencies = []
 
 [project.optional-dependencies]
 ollama = ["ollama>=0.6.2"]
+openai = ["httpx>=0.27"]
 llama-cpp = [
     "huggingface-hub>=1.15.0",
     "llama-cpp-python>=0.3.23",
@@ -47,6 +50,7 @@ server = [
 ]
 all = [
     "ollama>=0.6.2",
+    "httpx>=0.27",
     "huggingface-hub>=1.15.0",
     "llama-cpp-python>=0.3.23",
     "fastapi>=0.111.0",

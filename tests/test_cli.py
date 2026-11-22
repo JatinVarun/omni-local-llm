@@ -2,6 +2,8 @@ import argparse
 import sys
 from unittest.mock import patch
 
+import pytest
+
 from omnillm import ChatChunk, ChatResponse, LocalLLMManager
 from omnillm.__main__ import (
     _handle_bench,
@@ -183,3 +185,50 @@ def test_cli_main_help_output(capsys):
     assert "chat" in captured.out
     assert "bench" in captured.out
     assert "fit" in captured.out
+
+
+def test_cli_config_option_works_before_or_after_subcommand():
+    parser = build_parser()
+
+    assert parser.parse_args(["--config", "a.toml", "run", "--model", "m", "hi"]).config == "a.toml"
+    assert parser.parse_args(["run", "--config", "b.toml", "--model", "m", "hi"]).config == "b.toml"
+    assert parser.parse_args(["run", "--model", "m", "hi"]).backend is None
+
+
+def test_cli_base_url_registers_ad_hoc_openai_backend(tmp_path, monkeypatch):
+    from omnillm import OpenAICompatibleAdapter
+    from omnillm.__main__ import build_manager
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("OMNILLM_CONFIG", raising=False)
+    args = build_parser().parse_args(["run", "--base-url", "http://localhost:1234", "--model", "qwen3", "hi"])
+
+    manager = build_manager(args)
+
+    assert args.backend == "openai"
+    assert manager.resolve("qwen3").ref == "openai/qwen3"
+    adapter = manager._get_backend("openai")
+    assert isinstance(adapter, OpenAICompatibleAdapter) and adapter.base_url == "http://localhost:1234/v1"
+
+
+def test_cli_models_lists_aliases(capsys):
+    manager = LocalLLMManager({"fake": RecordingBackend(models=["llama3"])}, default_backend="fake")
+    manager.register_alias("coder", model="fake/qwen", fallbacks=["fake/llama3"])
+
+    _handle_models(argparse.Namespace(backend=None), manager)
+
+    out = capsys.readouterr().out
+    assert "coder" in out and "fake/qwen" in out and "fake/llama3" in out
+
+
+def test_cli_reports_config_errors(tmp_path, monkeypatch, capsys):
+    bad = tmp_path / "bad.toml"
+    bad.write_text("[models.a]\ntemprature = 1\n")
+    monkeypatch.setattr(sys, "argv", ["omnillm", "--config", str(bad), "models"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        main()
+
+    assert exit_info.value.code == 2
+    assert "Config error" in capsys.readouterr().err

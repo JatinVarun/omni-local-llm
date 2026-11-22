@@ -286,3 +286,33 @@ def test_streaming_tool_calls_have_indexes_finish_reason_and_optional_usage():
     assert events[-2]["choices"][0]["finish_reason"] == "tool_calls"
     assert events[-1]["choices"] == []
     assert events[-1]["usage"] == {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+
+
+def test_server_routes_aliases_and_lists_them():
+    backend = RecordingBackend(response=ChatResponse(content="ok"), models=["llama3"])
+    manager = LocalLLMManager({"fake": backend}, default_backend="fake")
+    manager.register_alias("coder", backend="fake", model="qwen-coder", temperature=0.2)
+    client = TestClient(create_app(manager))
+
+    chat = client.post("/v1/chat/completions", json={"model": "coder", "messages": [{"role": "user", "content": "x"}]})
+    namespaced = client.post(
+        "/v1/chat/completions", json={"model": "huihui_ai/qwen3", "messages": [{"role": "user", "content": "x"}]}
+    )
+    models = client.get("/v1/models").json()["data"]
+
+    assert chat.status_code == 200 and chat.json()["model"] == "coder"
+    assert (backend.requests[0].model, backend.requests[0].temperature) == ("qwen-coder", 0.2)
+    assert namespaced.status_code == 200 and backend.requests[1].model == "huihui_ai/qwen3"
+    assert {"id": "coder", "object": "model", "created": 0, "owned_by": "alias:fake/qwen-coder"} in models
+    assert any(m["id"] == "fake/llama3" for m in models)
+
+
+def test_server_module_app_is_built_lazily(monkeypatch, tmp_path):
+    import omnillm.server as server
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("OMNILLM_CONFIG", raising=False)
+    monkeypatch.setattr(server, "_default_app", None)
+
+    assert server.app is server.app

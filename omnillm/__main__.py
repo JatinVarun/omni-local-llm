@@ -5,9 +5,15 @@ from collections.abc import Iterator
 from typing import Any
 
 from omnillm import ChatResponse, LocalLLMManager
+from omnillm.core.config import ConfigError
 from omnillm.harness.benchmark import BenchmarkHarness, BenchmarkTarget
 from omnillm.harness.eval import EvalHarness, EvalTestCase
 from omnillm.harness.needle import NeedleHarness
+
+
+def _describe_target(manager: LocalLLMManager, args: argparse.Namespace) -> str:
+    target = manager.resolve(args.model, args.backend)
+    return f"{target.alias} → {target.ref}" if target.alias else target.ref
 
 
 def _handle_chat(args: argparse.Namespace, manager: LocalLLMManager) -> None:
@@ -19,7 +25,7 @@ def _handle_chat(args: argparse.Namespace, manager: LocalLLMManager) -> None:
         max_tokens_budget=args.max_tokens,
     )
 
-    print(f"🤖 Omni-Local-LLM Interactive Chat [{args.backend}/{args.model}]")
+    print(f"🤖 Omni-Local-LLM Interactive Chat [{_describe_target(manager, args)}]")
     print("Commands: /clear, /reset [prompt], /tokens, /system <prompt>, /exit\n")
 
     options: dict[str, Any] = {}
@@ -125,9 +131,17 @@ def _handle_run(args: argparse.Namespace, manager: LocalLLMManager) -> None:
 def _handle_models(args: argparse.Namespace, manager: LocalLLMManager) -> None:
     try:
         models = manager.list_models(backend=args.backend)
+        aliases = {} if args.backend else manager.aliases
     except Exception as error:
         print(f"Error listing models: {error}", file=sys.stderr)
         sys.exit(1)
+
+    if aliases:
+        print(f"{'ALIAS':<15} {'TARGET':<45} {'FALLBACKS'}")
+        print("-" * 78)
+        for name, target in aliases.items():
+            print(f"{name:<15} {target.ref:<45} {', '.join(target.fallbacks) or '-'}")
+        print()
 
     if not models:
         print("No models detected.")
@@ -148,6 +162,8 @@ def _handle_bench(args: argparse.Namespace, manager: LocalLLMManager) -> None:
             t = t.strip()
             if t:
                 targets.append(BenchmarkTarget.from_spec(t))
+    elif args.backend is None:
+        targets.append(harness._target(args.model))
     else:
         targets.append(BenchmarkTarget(backend=args.backend, model=args.model))
 
@@ -170,7 +186,7 @@ def _handle_eval(args: argparse.Namespace, manager: LocalLLMManager) -> None:
     if args.needle:
         needle_harness = NeedleHarness(manager)
         depths = [int(d.strip()) for d in args.depths.split(",")] if args.depths else (0, 25, 50, 75, 100)
-        print(f"Running Needle in a Haystack evaluation on {args.backend}/{args.model}...", file=sys.stderr)
+        print(f"Running Needle in a Haystack evaluation on {_describe_target(manager, args)}...", file=sys.stderr)
         result = needle_harness.run(
             backend=args.backend,
             model=args.model,
@@ -203,7 +219,10 @@ def _handle_eval(args: argparse.Namespace, manager: LocalLLMManager) -> None:
             ),
         ]
 
-    print(f"Running evaluation suite ({len(test_cases)} tests) on {args.backend}/{args.model}...", file=sys.stderr)
+    print(
+        f"Running evaluation suite ({len(test_cases)} tests) on {_describe_target(manager, args)}...",
+        file=sys.stderr,
+    )
     suite_result = eval_harness.run_suite(backend=args.backend, model=args.model, test_cases=test_cases)
 
     if args.json:
@@ -295,16 +314,33 @@ def _handle_fit(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # Shared options. SUPPRESS keeps a subcommand from overwriting a value given before the subcommand name.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--config",
+        default=argparse.SUPPRESS,
+        help="Path to an omnillm.toml config (default: $OMNILLM_CONFIG, ./omnillm.toml, ~/.config/omnillm/config.toml)",
+    )
+    common.add_argument(
+        "--base-url",
+        default=argparse.SUPPRESS,
+        help="Use an OpenAI-compatible server (e.g. http://localhost:1234/v1 for LM Studio) without a config file",
+    )
+    common.add_argument("--api-key", default=argparse.SUPPRESS, help="API key for --base-url")
     parser = argparse.ArgumentParser(
         prog="omnillm",
         description="Omni-Local-LLM: Unified local LLM CLI, server, and evaluation harness.",
+        parents=[common],
     )
+
+    backend_help = "Backend name (default: taken from the model alias or 'backend/model' prefix, else ollama)"
+    model_help = "Model: an alias, 'backend/model', or a model name"
     subparsers = parser.add_subparsers(dest="subcommand", help="Available subcommands")
 
     # 1. Chat
-    chat_p = subparsers.add_parser("chat", help="Start an interactive chat session")
-    chat_p.add_argument("--backend", default="ollama", help="Backend to use (ollama, llama.cpp)")
-    chat_p.add_argument("--model", required=True, help="Model name")
+    chat_p = subparsers.add_parser("chat", help="Start an interactive chat session", parents=[common])
+    chat_p.add_argument("--backend", default=None, help=backend_help)
+    chat_p.add_argument("--model", required=True, help=model_help)
     chat_p.add_argument("--filename", help="GGUF filename for llama.cpp")
     chat_p.add_argument("--system", help="System prompt")
     chat_p.add_argument("--temperature", type=float, help="Sampling temperature")
@@ -313,23 +349,25 @@ def build_parser() -> argparse.ArgumentParser:
     chat_p.add_argument("--max-tokens", type=int, help="Context token budget for sliding-window pruning")
 
     # 2. Run (one-shot)
-    run_p = subparsers.add_parser("run", help="Execute a one-shot prompt from argument or stdin")
+    run_p = subparsers.add_parser("run", help="Execute a one-shot prompt from argument or stdin", parents=[common])
     run_p.add_argument("prompt", nargs="?", default="", help="Prompt text")
-    run_p.add_argument("--backend", default="ollama", help="Backend to use (ollama, llama.cpp)")
-    run_p.add_argument("--model", required=True, help="Model name")
+    run_p.add_argument("--backend", default=None, help=backend_help)
+    run_p.add_argument("--model", required=True, help=model_help)
     run_p.add_argument("--filename", help="GGUF filename for llama.cpp")
     run_p.add_argument("--temperature", type=float, help="Sampling temperature")
     run_p.add_argument("--stream", action="store_true", help="Stream the response")
 
     # 3. Models
-    models_p = subparsers.add_parser("models", help="List detected or installed models")
-    models_p.add_argument("--backend", help="Filter by backend (ollama, llama.cpp)")
+    models_p = subparsers.add_parser("models", help="List aliases and models from all backends", parents=[common])
+    models_p.add_argument("--backend", help="Only list models from this backend")
 
     # 4. Benchmark
-    bench_p = subparsers.add_parser("bench", help="Benchmark performance (TTFT and throughput)")
-    bench_p.add_argument("--targets", help="Comma-separated targets (e.g. 'ollama/llama3,llama.cpp/model')")
-    bench_p.add_argument("--backend", default="ollama", help="Default backend")
-    bench_p.add_argument("--model", default="llama3", help="Default model")
+    bench_p = subparsers.add_parser("bench", help="Benchmark performance (TTFT and throughput)", parents=[common])
+    bench_p.add_argument(
+        "--targets", help="Comma-separated aliases or 'backend/model' refs (e.g. 'coder,ollama/llama3')"
+    )
+    bench_p.add_argument("--backend", default=None, help=backend_help)
+    bench_p.add_argument("--model", default="llama3", help=model_help)
     bench_p.add_argument("--prompt", default="Explain the theory of relativity in 3 sentences.", help="Prompt")
     bench_p.add_argument("--tokens", type=int, default=128, help="Maximum tokens to generate")
     bench_p.add_argument("--runs", type=int, default=3, help="Number of benchmark iterations")
@@ -337,9 +375,11 @@ def build_parser() -> argparse.ArgumentParser:
     bench_p.add_argument("--json", action="store_true", help="Output raw JSON metrics")
 
     # 5. Eval
-    eval_p = subparsers.add_parser("eval", help="Run model evaluations, test suites, or needle-in-haystack")
-    eval_p.add_argument("--backend", default="ollama", help="Backend to evaluate")
-    eval_p.add_argument("--model", required=True, help="Model to evaluate")
+    eval_p = subparsers.add_parser(
+        "eval", help="Run model evaluations, test suites, or needle-in-haystack", parents=[common]
+    )
+    eval_p.add_argument("--backend", default=None, help=backend_help)
+    eval_p.add_argument("--model", required=True, help=model_help)
     eval_p.add_argument("--suite", help="Path to JSONL evaluation test suite file")
     eval_p.add_argument("--needle", action="store_true", help="Run Needle-In-A-Haystack context evaluation")
     eval_p.add_argument("--secret-code", default="BLUE-TITAN-42", help="Secret needle password")
@@ -347,7 +387,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_p.add_argument("--json", action="store_true", help="Output raw JSON results")
 
     # 6. Serve
-    serve_p = subparsers.add_parser("serve", help="Launch the OpenAI-compatible FastAPI server")
+    serve_p = subparsers.add_parser("serve", help="Launch the OpenAI-compatible FastAPI server", parents=[common])
     serve_p.add_argument("--host", default="127.0.0.1", help="Host address")
     serve_p.add_argument("--port", type=int, default=8000, help="Port number")
 
@@ -364,7 +404,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit_p.add_argument("--json", action="store_true", help="Output raw JSON analysis")
 
     # Top-level fallback arguments for backwards compatibility (e.g. `python -m omnillm --model llama3`)
-    parser.add_argument("--backend", default="ollama", help=argparse.SUPPRESS)
+    parser.add_argument("--backend", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--model", help=argparse.SUPPRESS)
     parser.add_argument("--filename", help=argparse.SUPPRESS)
     parser.add_argument("--system", help=argparse.SUPPRESS)
@@ -376,10 +416,33 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_manager(args: argparse.Namespace) -> LocalLLMManager:
+    """Loads the config file and applies an ad-hoc --base-url backend, if given."""
+    manager = LocalLLMManager.from_config(getattr(args, "config", None))
+    base_url = getattr(args, "base_url", None)
+    if base_url:
+        from omnillm.adapters.openai_adapter import OpenAICompatibleAdapter
+
+        name = getattr(args, "backend", None) or "openai"
+        api_key = getattr(args, "api_key", None)
+        manager.register_backend(name, lambda: OpenAICompatibleAdapter(base_url, api_key=api_key, name=name))
+        if hasattr(args, "backend"):
+            args.backend = name
+        manager.default_backend = name
+    return manager
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    manager = LocalLLMManager()
+    if args.subcommand == "fit":
+        _handle_fit(args)
+        return
+    try:
+        manager = build_manager(args)
+    except ConfigError as error:
+        print(f"❌ Config error: {error}", file=sys.stderr)
+        sys.exit(2)
 
     if args.subcommand == "chat":
         _handle_chat(args, manager)
@@ -393,8 +456,6 @@ def main() -> None:
         _handle_eval(args, manager)
     elif args.subcommand == "serve":
         _handle_serve(args, manager)
-    elif args.subcommand == "fit":
-        _handle_fit(args)
     else:
         # Fallback to chat if --model was provided at top-level
         if getattr(args, "model", None):

@@ -124,13 +124,13 @@ class EvalHarness:
 
     def run_suite(
         self,
-        backend: str,
+        backend: str | None,
         model: str,
         test_cases: Sequence[EvalTestCase],
         **common_options: Any,
     ) -> EvalSuiteResult:
         """Runs the test suite synchronously against a model."""
-        suite_result = EvalSuiteResult(backend=backend, model=model)
+        suite_result = EvalSuiteResult(backend=backend or self.manager.resolve(model).backend, model=model)
 
         for tc in test_cases:
             opts = {**common_options, **tc.options}
@@ -205,13 +205,13 @@ class EvalHarness:
 
     async def arun_suite(
         self,
-        backend: str,
+        backend: str | None,
         model: str,
         test_cases: Sequence[EvalTestCase],
         **common_options: Any,
     ) -> EvalSuiteResult:
         """Runs the test suite asynchronously against a model."""
-        suite_result = EvalSuiteResult(backend=backend, model=model)
+        suite_result = EvalSuiteResult(backend=backend or self.manager.resolve(model).backend, model=model)
 
         for tc in test_cases:
             opts = {**common_options, **tc.options}
