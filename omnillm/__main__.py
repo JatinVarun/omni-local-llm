@@ -2,6 +2,7 @@ import argparse
 import json
 import sys
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 from omnillm import ChatResponse, LocalLLMManager
@@ -272,7 +273,7 @@ def _serve_allowed_hosts(args: argparse.Namespace) -> list[str] | None:
 
 def _handle_fit(args: argparse.Namespace, manager: LocalLLMManager | None = None) -> None:
     from omnillm.core.errors import OmniLLMError
-    from omnillm.core.fit import alias_snippet, analyze_model_fit, pull_quant
+    from omnillm.core.fit import alias_snippet, analyze_model_fit, pull_quant, save_alias, select_result
     from omnillm.core.hardware import QuantFitStatus, detect_hardware, suggest_models_for_hardware
 
     hardware = detect_hardware()
@@ -334,14 +335,25 @@ def _handle_fit(args: argparse.Namespace, manager: LocalLLMManager | None = None
 
     pull = getattr(args, "pull", False)
     quant = getattr(args, "quant", None)
+    alias_name = getattr(args, "save_alias", None)
     if not args.json:
         print("\n" + rec.format_table() + "\n")
+    if alias_name and not pull:
+        try:
+            result = select_result(rec, quant)
+            saved = save_alias(rec, result, alias_name, _alias_config_path(args))
+        except (OmniLLMError, ValueError) as error:
+            print(f"❌ {error}", file=sys.stderr)
+            sys.exit(1)
+        print(f"✅ Saved alias '{alias_name}' ({result.quant}) to {_display_path(saved)}. It downloads on first use:")
+        print(f'   omnillm run --model {alias_name} "Hello!"')
+        return
     if not pull:
         if args.json:
             print(json.dumps(rec.to_dict(), indent=2))
         elif rec.source == "huggingface-gguf" and rec.recommended is not None:
             print(
-                f"⬇️  Download it with: omnillm fit {args.model} --pull"
+                f"⬇️  Download it with: omnillm fit {args.model} --pull --save-alias <name>"
                 + (f" --context {rec.context_length}" if args.context else "")
             )
         return
@@ -357,11 +369,36 @@ def _handle_fit(args: argparse.Namespace, manager: LocalLLMManager | None = None
     if args.json:
         print(json.dumps({**rec.to_dict(), "downloaded": {"quant": result.quant, "path": str(path)}}, indent=2))
         return
-    print(f"✅ {result.quant} downloaded to {path}\n")
+    print(f"✅ {result.quant} downloaded to {_display_path(path)}\n")
+    if alias_name:
+        try:
+            saved = save_alias(rec, result, alias_name, _alias_config_path(args))
+        except (OmniLLMError, ValueError) as error:
+            print(f"❌ {error}", file=sys.stderr)
+            sys.exit(1)
+        print(f"✅ Saved alias '{alias_name}' to {_display_path(saved)}. Run it with:")
+        print(f'   omnillm run --model {alias_name} "Hello!"')
+        return
     print("Use it:")
     print(f"  omnillm chat --backend llama.cpp --model {rec.repo} --filename {result.files[0]}\n")
-    print("Or add this alias to omnillm.toml and run `omnillm chat --model <alias>`:\n")
+    print("Or add this alias to omnillm.toml (or pass --save-alias NAME) and run `omnillm chat --model <alias>`:\n")
     print("  " + alias_snippet(rec, result).replace("\n", "\n  ") + "\n")
+
+
+def _display_path(path: Path) -> str:
+    """Shortens paths for display: ./relative under the working directory, ~/... under the home directory."""
+    resolved = Path(path).expanduser().resolve()
+    for base, prefix in ((Path.cwd().resolve(), "./"), (Path.home().resolve(), "~/")):
+        if resolved.is_relative_to(base):
+            return prefix + str(resolved.relative_to(base))
+    return str(path)
+
+
+def _alias_config_path(args: argparse.Namespace) -> Path:
+    """The config file in effect (so a user config isn't shadowed), else ./omnillm.toml."""
+    from omnillm.core.config import LOCAL_CONFIG_NAME, find_config_file
+
+    return find_config_file(getattr(args, "config", None)) or Path.cwd() / LOCAL_CONFIG_NAME
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -474,6 +511,11 @@ def build_parser() -> argparse.ArgumentParser:
     fit_p.add_argument("--pull", action="store_true", help="Download the recommended GGUF (Hugging Face repos)")
     fit_p.add_argument("--quant", help="With --pull: download this quant instead of the recommendation (e.g. Q5_K_M)")
     fit_p.add_argument("--offline", action="store_true", help="Don't query Hugging Face or Ollama; estimate only")
+    fit_p.add_argument(
+        "--save-alias",
+        metavar="NAME",
+        help="Save the recommended (or --quant) GGUF as an alias in your omnillm.toml (Hugging Face repos)",
+    )
     fit_p.add_argument("--params", type=float, help="Explicit parameter count in billions (overrides auto-detection)")
     fit_p.add_argument("--json", action="store_true", help="Output raw JSON analysis")
 

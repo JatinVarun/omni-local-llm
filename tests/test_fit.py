@@ -157,3 +157,45 @@ def test_pull_rejects_non_hf_sources():
 
     with pytest.raises(InvalidRequestError, match="--pull needs a Hugging Face GGUF repo"):
         pull_quant(rec)
+
+
+def test_save_alias_appends_valid_config_and_rejects_duplicates(tmp_path: Path):
+    from omnillm.core.config import load_config
+    from omnillm.core.fit import save_alias, select_result
+
+    rec = analyze_model_fit("org/Llama-3.2-GGUF", hardware=HW, hf_client=hub_client(gguf_hub()))
+    result = select_result(rec, "Q4_K_M")
+    config = tmp_path / "omnillm.toml"
+    config.write_text(
+        'default_backend = "ollama"\n\n[models.fast]\nmodel = "ollama/llama3.2:3b"'
+    )  # no trailing newline
+
+    save_alias(rec, result, "llama-3.2", config)
+
+    loaded = load_config(config)
+    assert {a.name for a in loaded.aliases} == {"fast", "llama-3.2"}
+    alias = next(a for a in loaded.aliases if a.name == "llama-3.2")
+    assert (alias.backend, alias.model, alias.options["filename"]) == (
+        "llama.cpp",
+        "org/Llama-3.2-GGUF",
+        "Llama-Q4_K_M.gguf",
+    )
+    assert '[models."llama-3.2"]' in config.read_text()  # dotted names are quoted, not nested tables
+
+    with pytest.raises(InvalidRequestError, match="already exists"):
+        save_alias(rec, result, "llama-3.2", config)
+    with pytest.raises(InvalidRequestError, match="must not contain"):
+        save_alias(rec, result, "a/b", config)
+
+    fresh = tmp_path / "new.toml"
+    save_alias(rec, result, "smol", fresh)
+    assert [a.name for a in load_config(fresh).aliases] == ["smol"]
+
+
+def test_save_alias_refuses_non_hf_sources(tmp_path: Path):
+    from omnillm.core.fit import save_alias
+
+    rec = analyze_model_fit("mistral:7b", hardware=HW, offline=True)
+    with pytest.raises(InvalidRequestError, match="--save-alias needs a Hugging Face GGUF repo"):
+        save_alias(rec, rec.results[0], "m", tmp_path / "x.toml")
+    assert not (tmp_path / "x.toml").exists()

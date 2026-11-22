@@ -122,3 +122,6 @@ jobs:
           /tmp/smoke/bin/python -I -c "import omnillm; print('omnillm', omnillm.__version__)"
           /tmp/smoke/bin/omnillm --help > /dev/null
           /tmp/smoke/bin/omnillm fit llama-3.1-8b --offline --json > /dev/null
+          # The headline command must read real Hugging Face data from a bare install (tolerate a Hub outage).
+          /tmp/smoke/bin/omnillm fit bartowski/SmolLM2-135M-Instruct-GGUF --json > fit.json
+          /tmp/smoke/bin/python -I -c "import json; d = json.load(open('fit.json')); n = ' '.join(d['notes']); assert d['source'] == 'huggingface-gguf' or 'Cannot reach Hugging Face' in n, (d['source'], n); print('fit source:', d['source'])"

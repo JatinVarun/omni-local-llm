@@ -193,40 +193,37 @@ class LlamaCPPAdapter(LLMBackend):
             )
         return self._llama_factory, self._hub_download
 
+    def _fetch(self, model_name: str, filename: str, source: ModelSource) -> str:
+        """Uses the local Hugging Face cache when the file is there (no network, works offline); downloads otherwise."""
+        _, hub_download = self._require_dependencies()
+        kwargs = {
+            "repo_id": model_name,
+            "filename": filename,
+            "revision": source.revision,
+            "cache_dir": source.cache_dir,
+        }
+        try:
+            return hub_download(**kwargs, local_files_only=True)
+        except Exception:
+            if source.local_files_only:
+                raise
+        return hub_download(**kwargs, local_files_only=False)
+
     def pull_model(self, model_name: str, source: ModelSource) -> str:
         if not source.filename:
             raise InvalidRequestError("llama.cpp requires a Hugging Face GGUF filename.")
-        _, hub_download = self._require_dependencies()
         if source.mmproj_filename:
-            hub_download(
-                repo_id=model_name,
-                filename=source.mmproj_filename,
-                revision=source.revision,
-                cache_dir=source.cache_dir,
-                local_files_only=source.local_files_only,
-            )
-        return hub_download(
-            repo_id=model_name,
-            filename=source.filename,
-            revision=source.revision,
-            cache_dir=source.cache_dir,
-            local_files_only=source.local_files_only,
-        )
+            self._fetch(model_name, source.mmproj_filename, source)
+        return self._fetch(model_name, source.filename, source)
 
     def _load_model(self, request: ChatRequest | EmbeddingRequest, embedding: bool = False) -> Any:
         clip_path: str | None = None
-        llama_factory, hub_download = self._require_dependencies()
+        llama_factory, _ = self._require_dependencies()
         if isinstance(request, ChatRequest):
             if request.runtime.clip_model_path:
                 clip_path = request.runtime.clip_model_path
             elif request.model_source.mmproj_filename:
-                clip_path = hub_download(
-                    repo_id=request.model,
-                    filename=request.model_source.mmproj_filename,
-                    revision=request.model_source.revision,
-                    cache_dir=request.model_source.cache_dir,
-                    local_files_only=request.model_source.local_files_only,
-                )
+                clip_path = self._fetch(request.model, request.model_source.mmproj_filename, request.model_source)
 
         key = (request.model, request.model_source, embedding, clip_path)
         if self._active_key == key and self._llm is not None:
