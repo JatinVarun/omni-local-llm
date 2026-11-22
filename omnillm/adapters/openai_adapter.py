@@ -12,7 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from omnillm.core.base import LLMBackend
-from omnillm.core.errors import BackendUnavailableError, InvalidRequestError, OmniLLMError
+from omnillm.core.errors import BackendUnavailableError, InvalidRequestError, ModelNotFoundError, OmniLLMError
 from omnillm.core.media import normalize_messages_for_openai
 from omnillm.core.tool_calls import to_openai_tool_call
 from omnillm.core.types import (
@@ -175,6 +175,8 @@ class OpenAICompatibleAdapter(LLMBackend):
             return BackendUnavailableError(f"{message} (check the API key)")
         if status in (408, 429) or status >= 500:
             return BackendUnavailableError(message)
+        if status == 404:
+            return ModelNotFoundError(message)
         return InvalidRequestError(message)
 
     # ----------------------------------------------------------------- payloads

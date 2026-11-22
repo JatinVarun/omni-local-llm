@@ -113,3 +113,12 @@ jobs:
 
       - name: Build sdist and wheel
         run: uv build
+
+      - name: Smoke-test the wheel in a clean environment (no extras)
+        run: |
+          uv venv /tmp/smoke --python 3.12
+          uv pip install --python /tmp/smoke/bin/python dist/*.whl
+          cd /tmp
+          /tmp/smoke/bin/python -I -c "import omnillm; print('omnillm', omnillm.__version__)"
+          /tmp/smoke/bin/omnillm --help > /dev/null
+          /tmp/smoke/bin/omnillm fit llama-3.1-8b --offline --json > /dev/null

@@ -65,3 +65,16 @@ def test_invalid_data_raises(tmp_path: Path, data: bytes, message: str):
         read_gguf_metadata(path)
     with pytest.raises(GGUFError, match=message):
         read_gguf_metadata_from_fetch(lambda start, end: data[start : end + 1])
+
+
+def test_deeply_nested_arrays_are_rejected_not_a_crash(tmp_path: Path):
+    import struct
+
+    depth = 5000  # would overflow the Python stack without a nesting limit
+    value = struct.pack("<I", 9) + b"".join(struct.pack("<IQ", 9, 1) for _ in range(depth))
+    data = b"GGUF" + struct.pack("<IQQ", 3, 0, 1) + struct.pack("<Q", 3) + b"key" + value
+    path = tmp_path / "evil.gguf"
+    path.write_bytes(data)
+
+    with pytest.raises(GGUFError, match="nested too deeply"):
+        read_gguf_metadata(path)

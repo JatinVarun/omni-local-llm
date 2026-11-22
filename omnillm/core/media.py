@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from omnillm.core.errors import InvalidRequestError
+from omnillm.core.errors import InvalidImageError
 from omnillm.core.tool_calls import to_ollama_tool_call, to_openai_tool_call
 from omnillm.core.types import ChatMessage
 
@@ -137,22 +137,22 @@ def _untrusted_image_to_data_uri(image: Any) -> str:
     never make the server read files from its own disk or fetch arbitrary URLs.
     """
     if not isinstance(image, str) or not image:
-        raise InvalidRequestError("Images must be base64 strings or data:image/...;base64,... URIs.")
+        raise InvalidImageError("Images must be base64 strings or data:image/...;base64,... URIs.")
     if image.startswith(("http://", "https://")):
-        raise InvalidRequestError("Remote image URLs are not supported; send the image inline as a base64 data URI.")
+        raise InvalidImageError("Remote image URLs are not supported; send the image inline as a base64 data URI.")
     if image.startswith("data:"):
         header, sep, payload = image.partition(",")
         if not sep or not header.startswith("data:image/") or not header.endswith(";base64"):
-            raise InvalidRequestError("Image data URIs must have the form data:image/<type>;base64,<data>.")
+            raise InvalidImageError("Image data URIs must have the form data:image/<type>;base64,<data>.")
         mime = header[len("data:") : -len(";base64")]
     else:
         mime, payload = "image/jpeg", image
     try:
         decoded = base64.b64decode(payload, validate=True)
     except (binascii.Error, ValueError) as error:
-        raise InvalidRequestError("Image payload is not valid base64.") from error
+        raise InvalidImageError("Image payload is not valid base64.") from error
     if not decoded:
-        raise InvalidRequestError("Image payload is empty.")
+        raise InvalidImageError("Image payload is empty.")
     return f"data:{mime};base64,{base64.b64encode(decoded).decode('ascii')}"
 
 

@@ -1,9 +1,14 @@
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _package_version
+
 from .adapters.openai_adapter import OpenAICompatibleAdapter
 from .core.config import ConfigError
 from .core.errors import (
     BackendNotFoundError,
     BackendUnavailableError,
+    InvalidImageError,
     InvalidRequestError,
+    ModelNotFoundError,
     OmniLLMError,
     ToolLoopLimitError,
     UnsupportedFeatureError,
@@ -33,7 +38,10 @@ from .core.types import (
 )
 from .harness import BenchmarkHarness, EvalHarness, NeedleHarness
 
-__version__ = "0.3.0"
+try:
+    __version__ = _package_version("omni-local-llm")
+except PackageNotFoundError:  # running from a source tree without installed metadata
+    __version__ = "0.0.0+unknown"
 __all__ = [
     "BackendNotFoundError",
     "BackendUnavailableError",
@@ -49,8 +57,10 @@ __all__ = [
     "EvalHarness",
     "FitRecommendation",
     "HardwareProfile",
+    "InvalidImageError",
     "InvalidRequestError",
     "LocalLLMManager",
+    "ModelNotFoundError",
     "ModelTarget",
     "NeedleHarness",
     "OmniLLMError",

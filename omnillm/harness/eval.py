@@ -4,12 +4,13 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
-
-from pydantic import BaseModel
+from typing import TYPE_CHECKING, Any
 
 from omnillm.core.manager import LocalLLMManager
 from omnillm.core.types import ChatResponse
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel  # only for type hints: pydantic is not a core dependency
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,7 +21,7 @@ class EvalTestCase:
     prompt: str
     system_prompt: str | None = None
     expected_pattern: str | None = None
-    expected_schema: type[BaseModel] | None = None
+    expected_schema: "type[BaseModel] | None" = None
     expected_tool_call: str | None = None
     tools: Sequence[dict[str, Any]] | None = None
     options: dict[str, Any] = field(default_factory=dict)

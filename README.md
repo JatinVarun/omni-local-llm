@@ -740,6 +740,9 @@ print(embedding_res.data[0].embedding)
 - **Images** must be sent inline as base64 or `data:image/...;base64,...` URIs. Local file paths and remote URLs are rejected so API clients can never make the server read its own files or fetch arbitrary URLs.
 - **`tool_choice`**: `"auto"` and `"none"` are supported; forcing a specific tool is not possible with local backends and returns a 400.
 - `seed`, `max_completion_tokens`, and `stream_options: {"include_usage": true}` are supported.
+- **Errors** follow the OpenAI shape (`{"error": {"message", "type", "code"}}`) with a fixed, server-written message and a request id (also in the `x-request-id` header). Exception details, which can include upstream backend output, are logged server-side under that id and never sent to clients.
+- **Host check (DNS-rebinding protection)**: only requests whose `Host` header is a loopback name are accepted by default, so a malicious web page can't reach your local server through DNS rebinding. When serving other machines, list the names clients use: `omnillm serve --host 0.0.0.0 --allowed-host gpu-box --allowed-host 192.168.1.20` (or set `OMNILLM_ALLOWED_HOSTS`; `'*'` disables the check, e.g. behind a reverse proxy).
+- There is no authentication yet: don't expose the server to untrusted networks.
 
 #### Use with curl
 
