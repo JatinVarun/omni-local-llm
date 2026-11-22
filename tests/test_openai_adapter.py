@@ -300,7 +300,7 @@ async def test_round_trip_against_omnillm_server():
         chunks=(ChatChunk(content="po"), ChatChunk(content="ng"), ChatChunk(tool_calls=(call,), usage=Usage(2, 2))),
     )
     app = create_app(LocalLLMManager({"fake": backend}))
-    adapter = OpenAICompatibleAdapter("http://omnillm/v1", async_transport=httpx.ASGITransport(app=app))
+    adapter = OpenAICompatibleAdapter("http://localhost/v1", async_transport=httpx.ASGITransport(app=app))
 
     response = await adapter.achat(ChatRequest(model="fake/echo", messages=[{"role": "user", "content": "ping"}]))
     stream = await adapter.achat(

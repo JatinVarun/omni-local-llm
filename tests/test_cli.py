@@ -261,3 +261,17 @@ def test_cli_fit_parser_options():
     )
 
     assert (args.pull, args.quant, args.kv_cache, args.context, args.offline) == (True, "Q5_K_M", "q8_0", None, False)
+
+
+def test_serve_allowed_hosts(monkeypatch):
+    from omnillm.__main__ import _serve_allowed_hosts
+
+    monkeypatch.delenv("OMNILLM_ALLOWED_HOSTS", raising=False)
+    parse = build_parser().parse_args
+
+    assert _serve_allowed_hosts(parse(["serve"])) == ["localhost", "127.0.0.1", "::1"]
+    assert _serve_allowed_hosts(parse(["serve", "--host", "192.168.1.5"]))[-1] == "192.168.1.5"
+    assert "localhost" in _serve_allowed_hosts(parse(["serve", "--host", "0.0.0.0"]))
+    assert _serve_allowed_hosts(parse(["serve", "--allowed-host", "a", "--allowed-host", "*.b"])) == ["a", "*.b"]
+    monkeypatch.setenv("OMNILLM_ALLOWED_HOSTS", "x")
+    assert _serve_allowed_hosts(parse(["serve"])) is None

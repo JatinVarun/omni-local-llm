@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from omnillm.core.base import LLMBackend
-from omnillm.core.errors import BackendUnavailableError, InvalidRequestError, OmniLLMError
+from omnillm.core.errors import BackendUnavailableError, InvalidRequestError, ModelNotFoundError, OmniLLMError
 from omnillm.core.media import normalize_messages_for_ollama
 from omnillm.core.tool_calls import to_openai_tool_call
 from omnillm.core.types import (
@@ -88,6 +88,8 @@ class OllamaAdapter(LLMBackend):
         if response_error is not None and isinstance(error, response_error):
             status = _value(error, "status_code") or -1
             message = f"Ollama error: {_value(error, 'error') or error}"
+            if status == 404:
+                return ModelNotFoundError(message)
             return InvalidRequestError(message) if 400 <= status < 500 else BackendUnavailableError(message)
         if isinstance(error, ConnectionError) or (httpx is not None and isinstance(error, httpx.TransportError)):
             return BackendUnavailableError(f"Cannot reach the Ollama server at {self.host}. Is `ollama serve` running?")

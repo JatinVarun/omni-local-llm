@@ -312,18 +312,22 @@ class LocalLLMManager:
         backend = target.backend
         adapter = self._get_backend(backend)
         if stream and not adapter.capabilities.streaming:
-            raise UnsupportedFeatureError(f"Backend '{backend}' does not support streaming.")
+            raise UnsupportedFeatureError(f"Backend '{backend}' does not support streaming.", feature="streaming")
         is_json, resolved_format = _resolve_response_format(response_model, response_format, json_mode)
         if is_json and not adapter.capabilities.json_mode:
-            raise UnsupportedFeatureError(f"Backend '{backend}' does not support JSON mode.")
+            raise UnsupportedFeatureError(f"Backend '{backend}' does not support JSON mode.", feature="json_mode")
         if (
             response_model is not None or (resolved_format and resolved_format.get("type") == "json_schema")
         ) and not getattr(adapter.capabilities, "structured_outputs", True):
-            raise UnsupportedFeatureError(f"Backend '{backend}' does not support structured outputs.")
+            raise UnsupportedFeatureError(
+                f"Backend '{backend}' does not support structured outputs.", feature="structured_outputs"
+            )
         if tools and not adapter.capabilities.tools:
-            raise UnsupportedFeatureError(f"Backend '{backend}' does not support tool calling.")
+            raise UnsupportedFeatureError(f"Backend '{backend}' does not support tool calling.", feature="tools")
         if has_images(messages) and not getattr(adapter.capabilities, "vision", True):
-            raise UnsupportedFeatureError(f"Backend '{backend}' does not support vision / multimodal inputs.")
+            raise UnsupportedFeatureError(
+                f"Backend '{backend}' does not support vision / multimodal inputs.", feature="vision"
+            )
         opts = _merge_options(target.options, options)
         return adapter, ChatRequest(
             model=target.model,
@@ -487,7 +491,9 @@ class LocalLLMManager:
 
         adapter = self._get_backend(target.backend)
         if not adapter.capabilities.embeddings:
-            raise UnsupportedFeatureError(f"Backend '{target.backend}' does not support embeddings.")
+            raise UnsupportedFeatureError(
+                f"Backend '{target.backend}' does not support embeddings.", feature="embeddings"
+            )
 
         defaults = {key: value for key, value in target.options.items() if key in _EMBED_OPTION_KEYS}
         opts = _merge_options(defaults, options)

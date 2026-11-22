@@ -1,14 +1,25 @@
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
 from omnillm import ChatChunk, ChatResponse, LocalLLMManager, Usage
+from omnillm.core.errors import (
+    BackendUnavailableError,
+    InvalidRequestError,
+    ModelNotFoundError,
+    UnsupportedFeatureError,
+)
 from omnillm.server import create_app
 from tests.fakes import RecordingBackend
 
 
+def local_client(app) -> TestClient:
+    return TestClient(app, base_url="http://localhost")
+
+
 def make_client(backend: RecordingBackend) -> TestClient:
-    return TestClient(create_app(LocalLLMManager({"fake": backend})))
+    return local_client(create_app(LocalLLMManager({"fake": backend})))
 
 
 def test_chat_completions_forwards_parameters_and_returns_usage():
@@ -292,7 +303,7 @@ def test_server_routes_aliases_and_lists_them():
     backend = RecordingBackend(response=ChatResponse(content="ok"), models=["llama3"])
     manager = LocalLLMManager({"fake": backend}, default_backend="fake")
     manager.register_alias("coder", backend="fake", model="qwen-coder", temperature=0.2)
-    client = TestClient(create_app(manager))
+    client = local_client(create_app(manager))
 
     chat = client.post("/v1/chat/completions", json={"model": "coder", "messages": [{"role": "user", "content": "x"}]})
     namespaced = client.post(
@@ -316,3 +327,104 @@ def test_server_module_app_is_built_lazily(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "_default_app", None)
 
     assert server.app is server.app
+
+
+SECRET = "Traceback (most recent call last): File /srv/internal/secret.py"
+
+
+@pytest.mark.parametrize(
+    ("error", "status", "code", "fragment"),
+    [
+        (InvalidRequestError(SECRET), 400, "invalid_request", "backend rejected the request"),
+        (ModelNotFoundError(SECRET), 404, "model_not_found", "not found on its backend"),
+        (UnsupportedFeatureError(SECRET, feature="tools"), 400, "unsupported_feature", "tool calling"),
+        (UnsupportedFeatureError(SECRET, feature="new-thing"), 400, "unsupported_feature", "a feature used"),
+        (BackendUnavailableError(SECRET), 503, "backend_unavailable", "currently unavailable"),
+        (ValueError(SECRET), 400, "invalid_request", "Invalid request parameters"),
+        (RuntimeError(SECRET), 500, "internal_error", "internal error"),
+    ],
+)
+def test_errors_never_echo_exception_text(error, status, code, fragment, caplog):
+    client = make_client(RecordingBackend(error=error))
+
+    with caplog.at_level("WARNING", logger="omnillm.server"):
+        response = client.post(
+            "/v1/chat/completions", json={"model": "fake/m", "messages": [{"role": "user", "content": "x"}]}
+        )
+
+    body = response.json()["error"]
+    request_id = response.headers["x-request-id"]
+    assert response.status_code == status
+    assert body["code"] == code and fragment in body["message"]
+    assert "secret" not in response.text and "Traceback" not in response.text
+    assert request_id in body["message"]
+    assert request_id in caplog.text and "secret.py" in caplog.text  # details stay in the server log
+
+
+def test_mid_stream_errors_never_echo_exception_text():
+    class FailingStream(RecordingBackend):
+        async def achat(self, request):
+            async def stream():
+                yield ChatChunk(content="partial")
+                raise InvalidRequestError(SECRET)
+
+            return stream()
+
+    response = make_client(FailingStream()).post(
+        "/v1/chat/completions", json={"model": "fake/m", "messages": [{"role": "user", "content": "x"}], "stream": True}
+    )
+
+    assert "partial" in response.text and "backend rejected the request" in response.text
+    assert "secret" not in response.text and response.text.rstrip().endswith("data: [DONE]")
+
+
+def test_server_written_validation_messages_stay_specific():
+    client = make_client(RecordingBackend())
+    remote_image = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake/m",
+            "messages": [{"role": "user", "content": "x", "images": ["https://example.com/a.png"]}],
+        },
+    )
+
+    assert remote_image.status_code == 400
+    assert remote_image.json()["error"]["code"] == "invalid_image"
+    assert "remote URLs are not accepted" in remote_image.json()["error"]["message"]
+
+
+def test_host_header_is_checked_to_block_dns_rebinding(monkeypatch):
+    monkeypatch.delenv("OMNILLM_ALLOWED_HOSTS", raising=False)
+    manager = LocalLLMManager({"fake": RecordingBackend(models=["m"])})
+
+    default = create_app(manager)
+    assert TestClient(default, base_url="http://attacker.example").get("/v1/models").status_code == 400
+    local = TestClient(default, base_url="http://localhost")
+    for host in ("localhost", "localhost:8000", "127.0.0.1:8000", "[::1]:8000", "[::1]", "LOCALHOST"):
+        assert local.get("/v1/models", headers={"host": host}).status_code == 200, host
+    for host in ("attacker.example:8000", "localhost.attacker.example", "", "127.0.0.1.nip.io"):
+        assert local.get("/v1/models", headers={"host": host}).status_code == 400, host
+
+    custom = create_app(manager, allowed_hosts=["llm.internal", "*.corp.example"])
+    assert TestClient(custom, base_url="http://llm.internal").get("/v1/models").status_code == 200
+    assert TestClient(custom, base_url="http://gpu.corp.example").get("/v1/models").status_code == 200
+    assert TestClient(custom, base_url="http://localhost").get("/v1/models").status_code == 400
+
+    anything = create_app(manager, allowed_hosts=["*"])
+    assert TestClient(anything, base_url="http://attacker.example").get("/v1/models").status_code == 200
+
+    monkeypatch.setenv("OMNILLM_ALLOWED_HOSTS", "gpu-box, 10.0.0.5")
+    from_env = create_app(manager)
+    assert TestClient(from_env, base_url="http://10.0.0.5").get("/v1/models").status_code == 200
+    assert TestClient(from_env, base_url="http://localhost").get("/v1/models").status_code == 400
+
+
+def test_logged_error_text_cannot_forge_log_lines(caplog):
+    client = make_client(RecordingBackend(error=InvalidRequestError("bad\nINFO forged entry\r\nmore")))
+
+    with caplog.at_level("WARNING", logger="omnillm.server"):
+        client.post("/v1/chat/completions", json={"model": "fake/m", "messages": [{"role": "user", "content": "x"}]})
+
+    record = next(r for r in caplog.records if r.name == "omnillm.server")
+    assert "\n" not in record.getMessage() and "\r" not in record.getMessage()
+    assert "forged entry" in record.getMessage()

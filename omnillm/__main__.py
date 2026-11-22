@@ -240,9 +240,34 @@ def _handle_serve(args: argparse.Namespace, manager: LocalLLMManager) -> None:
         print("The API server requires optional dependencies: install omni-local-llm[server]", file=sys.stderr)
         sys.exit(1)
 
-    app = create_app(manager=manager)
+    app = create_app(manager=manager, allowed_hosts=_serve_allowed_hosts(args))
     print(f"Starting Omni-Local-LLM OpenAI-Compatible API on http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)
+
+
+def _serve_allowed_hosts(args: argparse.Namespace) -> list[str] | None:
+    """Host headers to accept: --allowed-host, else $OMNILLM_ALLOWED_HOSTS, else loopback plus the bind address."""
+    import os
+    import socket
+
+    from omnillm.server import ALLOWED_HOSTS_ENV, LOOPBACK_HOSTS
+
+    if getattr(args, "allowed_host", None):
+        return list(args.allowed_host)
+    if os.environ.get(ALLOWED_HOSTS_ENV):
+        return None
+    host = args.host
+    if host in LOOPBACK_HOSTS:
+        return list(LOOPBACK_HOSTS)
+    if host in ("0.0.0.0", "::", ""):
+        names = [*LOOPBACK_HOSTS, socket.gethostname()]
+        print(
+            f"⚠️  Listening on all interfaces. Accepting Host headers: {', '.join(names)}. "
+            "Add --allowed-host <name-or-IP> for each address clients use (or '*' to accept any).",
+            file=sys.stderr,
+        )
+        return names
+    return [*LOOPBACK_HOSTS, host]
 
 
 def _handle_fit(args: argparse.Namespace, manager: LocalLLMManager | None = None) -> None:
@@ -416,6 +441,13 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p = subparsers.add_parser("serve", help="Launch the OpenAI-compatible FastAPI server", parents=[common])
     serve_p.add_argument("--host", default="127.0.0.1", help="Host address")
     serve_p.add_argument("--port", type=int, default=8000, help="Port number")
+    serve_p.add_argument(
+        "--allowed-host",
+        action="append",
+        metavar="HOST",
+        help="Accept requests with this Host header (repeatable; '*.domain' wildcards, '*' for any). "
+        "Defaults to loopback names plus the bind address, to block DNS-rebinding attacks.",
+    )
 
     # 7. Fit (Hardware & Quantization Recommender)
     fit_p = subparsers.add_parser(

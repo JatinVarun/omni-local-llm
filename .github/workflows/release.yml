@@ -24,6 +24,14 @@ jobs:
           enable-cache: true
           python-version: "3.12"
 
+      - name: Check that the tag matches the package version
+        run: |
+          VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match pyproject.toml version $VERSION. Bump the version first."
+            exit 1
+          fi
+
       - name: Install dependencies
         run: uv sync --frozen
 
@@ -51,6 +59,15 @@ jobs:
 
       - name: Build sdist and wheel
         run: uv build
+
+      - name: Smoke-test the wheel in a clean environment (no extras)
+        run: |
+          uv venv /tmp/smoke --python 3.12
+          uv pip install --python /tmp/smoke/bin/python dist/*.whl
+          cd /tmp
+          /tmp/smoke/bin/python -I -c "import omnillm; print('omnillm', omnillm.__version__)"
+          /tmp/smoke/bin/omnillm --help > /dev/null
+          /tmp/smoke/bin/omnillm fit llama-3.1-8b --offline --json > /dev/null
 
       - name: Upload distributions
         uses: actions/upload-artifact@v4

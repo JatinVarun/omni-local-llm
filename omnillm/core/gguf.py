@@ -30,6 +30,7 @@ _SCALARS: dict[int, tuple[str, int]] = {
 _STRING = 8
 _ARRAY = 9
 _MAX_ARRAY_ITEMS_DECODED = 64  # small arrays (e.g. per-layer head counts) are decoded; big ones skipped
+_MAX_NESTING = 8  # arrays of arrays; real files use at most 2 levels
 
 
 class GGUFError(ValueError):
@@ -92,17 +93,19 @@ def _read_string(source: _Source) -> str:
     return source.read(length).decode("utf-8", errors="replace")
 
 
-def _read_value(source: _Source, value_type: int) -> Any:
+def _read_value(source: _Source, value_type: int, depth: int = 0) -> Any:
     if value_type in _SCALARS:
         fmt, size = _SCALARS[value_type]
         return source.unpack(fmt, size)
     if value_type == _STRING:
         return _read_string(source)
     if value_type == _ARRAY:
+        if depth >= _MAX_NESTING:
+            raise GGUFError("GGUF arrays are nested too deeply; the file is corrupt or malicious.")
         item_type = source.unpack("<I", 4)
         count = source.unpack("<Q", 8)
         if count <= _MAX_ARRAY_ITEMS_DECODED:
-            return [_read_value(source, item_type) for _ in range(count)]
+            return [_read_value(source, item_type, depth + 1) for _ in range(count)]
         if item_type in _SCALARS:
             source.skip(count * _SCALARS[item_type][1])
         elif item_type == _STRING:
@@ -110,7 +113,7 @@ def _read_value(source: _Source, value_type: int) -> Any:
                 source.skip(source.unpack("<Q", 8))
         else:
             for _ in range(count):
-                _read_value(source, item_type)
+                _read_value(source, item_type, depth + 1)
         return None  # large array: skipped
     raise GGUFError(f"Unknown GGUF value type {value_type}.")
 
