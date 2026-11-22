@@ -554,3 +554,30 @@ def test_ollama_host_configures_real_clients():
 
     assert adapter.host == "http://gpu-box:11434"
     assert str(adapter._client._client.base_url).startswith("http://gpu-box:11434")
+
+
+def test_llamacpp_uses_local_cache_before_the_network():
+    calls: list[bool] = []
+    cached = {"hit": True}
+
+    def download(**kwargs: Any) -> str:
+        calls.append(kwargs["local_files_only"])
+        if kwargs["local_files_only"] and not cached["hit"]:
+            raise FileNotFoundError("not in cache")
+        return f"/cache/{kwargs['filename']}"
+
+    adapter = LlamaCPPAdapter(llama_factory=FakeLlama, hub_download=download)
+    source = ModelSource(filename="m.gguf")
+
+    assert adapter.pull_model("o/m", source) == "/cache/m.gguf"
+    assert calls == [True]  # cache hit: no network request
+
+    calls.clear()
+    cached["hit"] = False
+    assert adapter.pull_model("o/m", source) == "/cache/m.gguf"
+    assert calls == [True, False]  # cache miss: download
+
+    calls.clear()
+    with pytest.raises(FileNotFoundError):
+        adapter.pull_model("o/m", ModelSource(filename="m.gguf", local_files_only=True))
+    assert calls == [True]  # offline mode never touches the network

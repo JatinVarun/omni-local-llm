@@ -275,3 +275,33 @@ def test_serve_allowed_hosts(monkeypatch):
     assert _serve_allowed_hosts(parse(["serve", "--allowed-host", "a", "--allowed-host", "*.b"])) == ["a", "*.b"]
     monkeypatch.setenv("OMNILLM_ALLOWED_HOSTS", "x")
     assert _serve_allowed_hosts(parse(["serve"])) is None
+
+
+def test_cli_fit_save_alias_without_pull_writes_the_config_in_effect(tmp_path, monkeypatch, capsys):
+    from omnillm.__main__ import _alias_config_path
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.delenv("OMNILLM_CONFIG", raising=False)
+    parse = build_parser().parse_args
+
+    assert _alias_config_path(parse(["fit", "x"])) == tmp_path / "omnillm.toml"
+    user = tmp_path / "xdg" / "omnillm" / "config.toml"
+    user.parent.mkdir(parents=True)
+    user.write_text("")
+    assert _alias_config_path(parse(["fit", "x"])) == user  # don't shadow the user's config with a new local file
+    explicit = tmp_path / "team.toml"
+    explicit.write_text("")
+    assert _alias_config_path(parse(["fit", "x", "--config", str(explicit)])) == explicit
+    assert parse(["fit", "org/repo", "--save-alias", "smol"]).save_alias == "smol"
+
+
+def test_display_path_shortens_cwd_and_home(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from omnillm.__main__ import _display_path
+
+    monkeypatch.chdir(tmp_path)
+    assert _display_path(tmp_path / "omnillm.toml") == "./omnillm.toml"
+    assert _display_path(Path.home() / ".cache" / "x.gguf") == "~/.cache/x.gguf"
+    assert _display_path(Path("/definitely/elsewhere.gguf")) == "/definitely/elsewhere.gguf"

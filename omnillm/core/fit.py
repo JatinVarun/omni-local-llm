@@ -69,7 +69,7 @@ def _from_hf(repo: str, offline: bool, param_count_b: float | None, hf_client: A
         return hf_model_info(repo, client=hf_client)
     except BackendUnavailableError as error:
         info = estimated_model_info(repo, param_count_b)
-        info.notes.insert(0, f"{error} Falling back to estimates.")
+        info.notes.insert(0, f"{str(error).rstrip('.')}. Falling back to estimates.")
         return info
 
 
@@ -214,12 +214,24 @@ def pull_quant(
     return path, result
 
 
+_BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def default_alias_name(recommendation: FitRecommendation) -> str:
+    repo = recommendation.repo or recommendation.model_name
+    return re.sub(r"(?i)[-_.]?gguf$", "", repo.split("/")[-1]).lower()
+
+
+def _toml_key(name: str) -> str:
+    return name if _BARE_KEY.match(name) else '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def alias_snippet(recommendation: FitRecommendation, result: QuantFitResult, name: str | None = None) -> str:
     """An omnillm.toml alias for a downloaded quant, with the context and GPU layers the analysis assumed."""
     repo = recommendation.repo or recommendation.model_name
-    alias = name or re.sub(r"(?i)[-_.]?gguf$", "", repo.split("/")[-1]).lower()
+    alias = name or default_alias_name(recommendation)
     lines = [
-        f"[models.{alias}]",
+        f"[models.{_toml_key(alias)}]",
         'backend = "llama.cpp"',
         f'model = "{repo}"',
         f'filename = "{result.files[0]}"',
@@ -228,3 +240,34 @@ def alias_snippet(recommendation: FitRecommendation, result: QuantFitResult, nam
     if result.n_gpu_layers is not None:
         lines.append(f"n_gpu_layers = {result.n_gpu_layers}")
     return "\n".join(lines)
+
+
+def save_alias(recommendation: FitRecommendation, result: QuantFitResult, name: str, config_path: str | Path) -> Path:
+    """Appends an alias for `result` to a config file (created if missing), validating before and after."""
+    from omnillm.core.config import ConfigError, load_config
+
+    if not name or "/" in name:
+        raise InvalidRequestError("Alias names must be non-empty and must not contain '/'.")
+    if recommendation.source != "huggingface-gguf" or not result.files:
+        raise InvalidRequestError("--save-alias needs a Hugging Face GGUF repo (e.g. 'unsloth/Qwen3-8B-GGUF').")
+    path = Path(config_path).expanduser()
+    snippet = alias_snippet(recommendation, result, name)
+    original: str | None = None
+    if path.exists():
+        existing = load_config(path)
+        if any(alias.name == name for alias in existing.aliases):
+            raise InvalidRequestError(f"Alias '{name}' already exists in {path}.")
+        original = path.read_text()
+        content = original.rstrip("\n") + "\n\n" + snippet + "\n"
+    else:
+        content = snippet + "\n"
+    path.write_text(content)
+    try:
+        load_config(path)
+    except ConfigError:
+        if original is None:
+            path.unlink()
+        else:
+            path.write_text(original)
+        raise
+    return path
