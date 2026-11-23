@@ -12,6 +12,8 @@ permissions:
 
 jobs:
   welcome:
+    # Greet outside contributors only: the maintainer and bots kept getting "first issue/PR" messages.
+    if: github.actor != github.repository_owner && !endsWith(github.actor, '[bot]')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/first-interaction@v3
