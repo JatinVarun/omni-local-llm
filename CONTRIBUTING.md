@@ -20,7 +20,7 @@ We welcome contributions of all kinds — new backend adapters, bug fixes, docum
 
 ## Code of Conduct
 
-This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md). By participating, you are expected to uphold this code. Please report unacceptable behavior via GitHub Issues.
+This project follows the [Contributor Covenant Code of Conduct, version 2.1](https://www.contributor-covenant.org/version/2/1/code_of_conduct/). By participating, you are expected to uphold it. Please report unacceptable behavior privately to the maintainer ([@matteoespo](https://github.com/matteoespo)) rather than in a public issue.
 
 ---
 
@@ -39,44 +39,45 @@ This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.
    git clone https://github.com/<your-username>/omni-local-llm.git
    cd omni-local-llm
    ```
-3. **Create a virtual environment and install dependencies:**
+3. **Install the package with all extras and the dev tools** (pytest, ruff, mypy):
    ```bash
-   uv venv
-   source .venv/bin/activate    # Linux/macOS
-   # .venv\Scripts\activate     # Windows
-   uv pip install -e ".[dev]"
+   uv sync
    ```
+   This creates `.venv/` from the lockfile; `uv run <command>` uses it automatically. The first sync compiles `llama-cpp-python`, which can take a few minutes (you need a C/C++ compiler and CMake).
 4. **Verify everything works:**
    ```bash
    uv run pytest
    ```
 
+For a map of the code, see [`docs/architecture.md`](docs/architecture.md).
+
 ---
 
 ## Development Workflow
 
+0. **Claim an issue first**: comment on it so the maintainer can assign it to you (GitHub only allows assigning people who have commented on the issue). For anything not covered by an issue, open one to discuss it before writing code.
 1. **Create a feature branch** from `main`:
    ```bash
    git checkout -b feature/my-feature
    ```
 2. **Make your changes** — keep commits focused and descriptive.
 3. **Write or update tests** for any new functionality.
-4. **Run the full check suite** before pushing:
+4. **Run the same checks as CI** before pushing:
    ```bash
-   # Lint
    uv run ruff check .
    uv run ruff format --check .
-
-   # Tests
-   uv run pytest --cov=omnillm
+   uv run mypy omnillm
+   uv run pytest
    ```
-5. **Push and open a Pull Request** against `main`.
+5. **Push and open a Pull Request** against `main`. Opening it early as a **draft** is welcome: you get feedback before polishing. On your first PR, a maintainer has to approve the CI run before checks start.
 
 ---
 
 ## Adding a New Backend Adapter
 
-To add support for a new inference backend (e.g., `vllm`, `llamafile`, `koboldcpp`):
+**First check whether you need one.** Servers that speak the OpenAI API (vLLM, llama.cpp's `llama-server`, LM Studio, SGLang, KoboldCpp, …) already work through `OpenAICompatibleAdapter`: add them in `omnillm.toml` with `type = "openai"` (see [`docs/backends.md`](docs/backends.md)). A new adapter is for backends with their own API.
+
+To add support for a new inference backend:
 
 1. **Create a new adapter** under `omnillm/adapters/`:
    ```
@@ -89,9 +90,9 @@ To add support for a new inference backend (e.g., `vllm`, `llamafile`, `koboldcp
    - `embed()` — synchronous vector embeddings (optional, if backend supports embeddings)
    - `aembed()` — asynchronous vector embeddings
    - `list_models()` — list available local models
-3. **Register the adapter** in the `LocalLLMManager` constructor in [`omnillm/core/manager.py`](omnillm/core/manager.py).
+3. **Register the adapter**: users can call `manager.register_backend(name, factory)`. To ship it built in, add it to the defaults in the `LocalLLMManager` constructor in [`omnillm/core/manager.py`](omnillm/core/manager.py), and add a `type` for it in [`omnillm/core/config.py`](omnillm/core/config.py) so it can be configured in `omnillm.toml`.
 4. **Add tests** under `tests/` using mocks (see existing tests for patterns).
-5. **Update the README** to mention the new backend.
+5. **Update the docs**: [`docs/backends.md`](docs/backends.md) and the README feature list.
 
 ---
 
@@ -141,7 +142,7 @@ The configuration lives in [`pyproject.toml`](pyproject.toml).
 
 ## Submitting a Pull Request
 
-1. Ensure all checks pass (lint + tests).
+1. Ensure all checks pass (lint, format, mypy, tests).
 2. Fill out the PR template completely.
 3. Reference any related issues (e.g., `Closes #42`).
 4. Keep PRs focused — one feature or fix per PR.
