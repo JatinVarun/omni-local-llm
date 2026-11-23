@@ -58,6 +58,35 @@ n_gpu_layers = -1
 
 Run `omnillm fit` without arguments for a compatibility matrix of popular models on your machine. Set `HF_TOKEN` for gated repos and `HF_ENDPOINT` for a mirror.
 
+## Accuracy
+
+Measured on a GTX 1650 (4 GB VRAM, 3.62 GB free) with 16 GB RAM, loading each installed Ollama model with the
+GPU layer count `fit` recommends and reading the VRAM actually used (`nvidia-smi`, per process). Speeds are
+medians of 3 runs, compared with Ollama's own automatic placement. Ollama 0.21.0, default f16 KV cache.
+
+| Model (Ollama) | Quant | Context | fit says | Predicted VRAM | Measured VRAM | tok/s at fit's layers | tok/s Ollama auto |
+|---|---|---|---|---|---|---|---|
+| llama3.2:3b | Q4_K_M | 4,096 | all on GPU | 2.83 GB | 2.68 GB | 56.1 | 56.2 |
+| llama3.2:3b | Q4_K_M | 8,192 | all on GPU | 3.33 GB | 3.12 GB | 55.9 | 43.4 |
+| phi3:latest | Q4_0 | 4,096 | 26/32 layers on GPU | 3.38 GB | 3.03 GB | 32.9 | 34.3 |
+| phi3:latest | Q4_0 | 8,192 | 18/32 layers on GPU | 3.40 GB | 3.03 GB | 23.5 | 21.1 |
+| qwen2.5:7b | Q4_K_M | 4,096 | 17/28 layers on GPU | 3.30 GB | 3.21 GB | 13.0 | 12.6 |
+| qwen2.5:7b | Q4_K_M | 8,192 | 16/28 layers on GPU | 3.33 GB | 3.19 GB | 12.0 | 11.8 |
+| llama3.1:latest | Q4_K_M | 4,096 | 18/32 layers on GPU | 3.39 GB | 3.26 GB | 11.3 | 11.1 |
+| llama3.1:latest | Q4_K_M | 8,192 | 16/32 layers on GPU | 3.40 GB | 3.25 GB | 11.4 | 10.8 |
+
+- **VRAM predictions were 0.09–0.37 GB above the measured value in all 8 cases** (3–12%), so `fit` errs on the
+  safe side, and every recommended configuration loaded without running out of memory.
+- At `fit`'s layer counts, decode speed was usually within a few percent of Ollama's automatic choice, slower in
+  one case (phi3 at 4K, −4%) and **29% faster** in another: for llama3.2:3b at 8K context, `fit` correctly
+  says the whole model fits on the GPU (3.12 GB measured), while Ollama keeps part of it on the CPU.
+- Not measured yet: system-RAM usage of the CPU part, Apple Silicon, AMD, and other runtimes.
+
+**Help make it more accurate:** with an NVIDIA GPU and Ollama, run
+`uv run python scripts/measure_fit_accuracy.py <model> [...]` and share the table in a
+[fit accuracy report](https://github.com/matteoespo/omni-local-llm/issues/new?template=fit_accuracy.yml).
+On other hardware, the report form asks for `fit`'s output and what you observed.
+
 ## Python SDK
 
 ```python
