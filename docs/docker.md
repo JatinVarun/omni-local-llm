@@ -11,7 +11,7 @@ The included `docker-compose.yml` sets up both an Ollama service and OmniLLM:
 docker compose up -d
 
 # Pull a model in Ollama
-docker compose exec ollama ollama run llama3.2:3b
+docker compose exec ollama ollama pull llama3.2:3b
 
 # Query OmniLLM's OpenAI-compatible endpoint
 curl -X POST http://127.0.0.1:8000/v1/chat/completions \
@@ -163,6 +163,9 @@ docker run -d \
 
 > [!NOTE]
 > Ensure that Ollama on the host is listening on all network interfaces (`0.0.0.0:11434`) so that requests from Docker containers can reach it. Set `OLLAMA_HOST=0.0.0.0:11434` in your host's Ollama service configuration.
+
+> [!WARNING]
+> Ollama has no authentication, so listening on `0.0.0.0` also exposes it to your local network. Block port 11434 from other machines with your firewall, or bind Ollama to the Docker bridge address instead (usually `OLLAMA_HOST=172.17.0.1:11434`; check with `ip addr show docker0`).
 
 ## Security Considerations
 
